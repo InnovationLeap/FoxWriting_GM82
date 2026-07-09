@@ -5,7 +5,6 @@
 #include <fstream>
 #include <sstream>
 #include <d3d9.h>
-#pragma comment(lib, "d3d9.lib")
 
 static void DebugLog(const char* fmt, ...)
 {
@@ -94,11 +93,6 @@ static std::vector<std::wstring> SplitLines(const std::wstring& text)
     return lines;
 }
 
-// ── D3D9 Present hook ──────────────────────────────────────
-typedef HRESULT (__stdcall *PresentFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
-static PresentFn g_origPresent = NULL;
-static bool g_d3dHooked = false;
-
 struct TextDrawItem {
     std::wstring text;
     float x, y;
@@ -112,139 +106,222 @@ struct TextDrawItem {
 };
 static std::vector<TextDrawItem> g_textQueue;
 
-static HRESULT __stdcall HookPresent(
-    IDirect3DDevice9* device,
-    CONST RECT* pSourceRect,
-    CONST RECT* pDestRect,
-    HWND hDestWindowOverride,
-    CONST RGNDATA* pDirtyRegion)
+// ── Direct3D 9 backbuffer render ─────────────────────────────
+// Reads the D3D9 device pointer from the gm82dx9 extension's
+// storage location (fixed address 0x6886a8, no ASLR in gm82vp.exe),
+// then hooks IDirect3DDevice9::Present[vtable 17] to render text
+// via GetBackBuffer → GetDC → GDI+ right before Present submits.
+
+static IDirect3DDevice9* g_d3d9Device = NULL;
+
+typedef HRESULT (__stdcall *Present9_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+static Present9_t g_realPresent9 = NULL;
+
+// Two-surface pipeline for GDI+ text rendering: sysmem surface (GetDC) →
+// default-pool surface (StretchRect) → backbuffer.
+static IDirect3DSurface9* g_textSurfaceSys = NULL; // D3DPOOL_SYSTEMMEM
+static IDirect3DSurface9* g_textSurfaceDef = NULL; // D3DPOOL_DEFAULT
+static int g_textSurfaceW = 0;
+static int g_textSurfaceH = 0;
+static D3DFORMAT g_textSurfaceFmt = D3DFMT_UNKNOWN;
+
+#define SAFE_RELEASE(p) do { if (p) { (p)->Release(); (p) = NULL; } } while(0)
+
+static bool EnsureTextSurfaces(IDirect3DDevice9* device, int backW, int backH, D3DFORMAT backFmt)
 {
-    DebugLog("HookPresent called, queue=%zu hooked=%d", g_textQueue.size(), g_d3dHooked);
-    if (device && !g_textQueue.empty()) {
-        if (!g_gameWindow || IsIconic(g_gameWindow)) {
-            // Skip drawing when minimized
-            g_textQueue.clear();
-            return g_origPresent(device, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
-        }
+    if (g_textSurfaceSys && g_textSurfaceW == backW && g_textSurfaceH == backH)
+        return true;
 
-        LPDIRECT3DSURFACE9 backbuf = NULL;
-        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuf))) {
-            HDC hdc = NULL;
-            if (SUCCEEDED(backbuf->GetDC(&hdc))) {
-                Gdiplus::Graphics g(hdc);
-                g.SetPageUnit(Gdiplus::UnitPixel);
-                g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-                g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-                g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    SAFE_RELEASE(g_textSurfaceSys);
+    SAFE_RELEASE(g_textSurfaceDef);
 
-                for (size_t i = 0; i < g_textQueue.size(); i++) {
-                    const TextDrawItem& item = g_textQueue[i];
-                    if (item.text.empty() || !item.font) continue;
-
-                    BYTE a = (BYTE)(item.alpha * 255.0f);
-                    BYTE r = (item.color >> 16) & 0xFF;
-                    BYTE gr = (item.color >> 8) & 0xFF;
-                    BYTE b = item.color & 0xFF;
-                    Gdiplus::Color textColor(a, r, gr, b);
-
-                    float fx = item.x + item.xOffset;
-                    float fy = item.y + item.yOffset;
-                    if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
-
-                    auto lines = SplitLines(item.text);
-                    if (lines.empty()) continue;
-
-                    Gdiplus::RectF bounds;
-                    g.MeasureString(lines[0].c_str(), -1, item.font,
-                        Gdiplus::PointF(0, 0), &bounds);
-                    float lineH = bounds.Height + item.lineSpacing;
-                    float totalH = (float)lines.size() * lineH - item.lineSpacing;
-
-                    float drawY = fy;
-                    if (item.valign == 1) drawY = fy - totalH / 2.0f;
-                    else if (item.valign == 2) drawY = fy - totalH;
-
-                    bool doStroke = item.doStroke;
-
-                    for (size_t li = 0; li < lines.size(); li++) {
-                        float lineX = fx;
-                        float lineY = drawY + (float)li * lineH;
-
-                        if (item.halign != 0) {
-                            Gdiplus::RectF lb;
-                            g.MeasureString(lines[li].c_str(), -1, item.font,
-                                Gdiplus::PointF(0, 0), &lb);
-                            if (item.halign == 1) lineX = fx - lb.Width / 2.0f;
-                            else if (item.halign == 2) lineX = fx - lb.Width;
-                        }
-
-                        if (item.pixelAlign) {
-                            lineX = floorf(lineX);
-                            lineY = floorf(lineY);
-                        }
-
-                        if (doStroke) {
-                            Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-                            for (int ox = -1; ox <= 1; ox++) {
-                                for (int oy = -1; oy <= 1; oy++) {
-                                    if (ox == 0 && oy == 0) continue;
-                                    g.DrawString(lines[li].c_str(), -1, item.font,
-                                        Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
-                                        &strokeBrush);
-                                }
-                            }
-                        }
-
-                        Gdiplus::SolidBrush textBrush(textColor);
-                        g.DrawString(lines[li].c_str(), -1, item.font,
-                            Gdiplus::PointF(lineX, lineY), &textBrush);
-                    }
-                }
-                backbuf->ReleaseDC(hdc);
-            }
-            backbuf->Release();
-        }
+    HRESULT hr = device->CreateOffscreenPlainSurface(backW, backH, backFmt, D3DPOOL_SYSTEMMEM, &g_textSurfaceSys, NULL);
+    if (FAILED(hr)) {
+        DebugLog("EnsureTextSurfaces: SYSMEM %dx%d fmt=%d failed hr=%08X", backW, backH, backFmt, hr);
+        return false;
     }
-    return g_origPresent(device, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+
+    hr = device->CreateOffscreenPlainSurface(backW, backH, backFmt, D3DPOOL_DEFAULT, &g_textSurfaceDef, NULL);
+    if (FAILED(hr)) {
+        DebugLog("EnsureTextSurfaces: DEFAULT %dx%d fmt=%d failed hr=%08X", backW, backH, backFmt, hr);
+        SAFE_RELEASE(g_textSurfaceSys);
+        return false;
+    }
+
+    g_textSurfaceW = backW;
+    g_textSurfaceH = backH;
+    g_textSurfaceFmt = backFmt;
+    DebugLog("EnsureTextSurfaces: %dx%d fmt=%d sys=%p def=%p", backW, backH, backFmt, g_textSurfaceSys, g_textSurfaceDef);
+    return true;
 }
 
-static void SetupD3DHook()
+// Draw queued text items on any HDC (called from Present hook).
+// Separate function avoids C2712 (__try with C++ dtors).
+static void RenderQueueOnDC(HDC hdc)
 {
-    HMODULE hD3D9 = LoadLibraryA("d3d9.dll");
-    if (!hD3D9) { DebugLog("SetupD3DHook: cannot load d3d9.dll"); return; }
-    typedef IDirect3D9* (WINAPI *D3DCreateFn)(UINT);
-    D3DCreateFn D3DCreate = (D3DCreateFn)GetProcAddress(hD3D9, "Direct3DCreate9");
-    if (!D3DCreate) { DebugLog("SetupD3DHook: Direct3DCreate9 not found"); return; }
+    Gdiplus::Graphics g(hdc);
+    g.SetPageUnit(Gdiplus::UnitPixel);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
 
-    IDirect3D9* d3d = D3DCreate(D3D_SDK_VERSION);
-    if (!d3d) { DebugLog("SetupD3DHook: D3DCreate failed"); return; }
+    for (size_t i = 0; i < g_textQueue.size(); i++) {
+        const TextDrawItem& item = g_textQueue[i];
+        if (item.text.empty() || !item.font) continue;
 
-    D3DPRESENT_PARAMETERS pp = {};
-    pp.Windowed = TRUE;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.hDeviceWindow = g_gameWindow;
-    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
-    pp.BackBufferCount = 1;
+        BYTE a = (BYTE)(item.alpha * 255.0f);
+        BYTE r = (item.color >> 16) & 0xFF;
+        BYTE gr = (item.color >> 8) & 0xFF;
+        BYTE b = item.color & 0xFF;
+        Gdiplus::Color textColor(a, r, gr, b);
 
-    IDirect3DDevice9* device = NULL;
-    HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL,
-        g_gameWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &device);
-    if (FAILED(hr) || !device) {
-        DebugLog("SetupD3DHook: CreateDevice failed hr=0x%08lx", hr);
-        d3d->Release(); return;
+        float fx = item.x + item.xOffset;
+        float fy = item.y + item.yOffset;
+        if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
+
+        auto lines = SplitLines(item.text);
+        if (lines.empty()) continue;
+
+        Gdiplus::RectF bounds;
+        g.MeasureString(lines[0].c_str(), -1, item.font,
+            Gdiplus::PointF(0, 0), &bounds);
+        float lineH = bounds.Height + item.lineSpacing;
+        float totalH = (float)lines.size() * lineH - item.lineSpacing;
+
+        float drawY = fy;
+        if (item.valign == 1) drawY = fy - totalH / 2.0f;
+        else if (item.valign == 2) drawY = fy - totalH;
+
+        for (size_t li = 0; li < lines.size(); li++) {
+            float lineX = fx;
+            float lineY = drawY + (float)li * lineH;
+
+            if (item.halign != 0) {
+                Gdiplus::RectF lb;
+                g.MeasureString(lines[li].c_str(), -1, item.font,
+                    Gdiplus::PointF(0, 0), &lb);
+                if (item.halign == 1) lineX = fx - lb.Width / 2.0f;
+                else if (item.halign == 2) lineX = fx - lb.Width;
+            }
+
+            if (item.pixelAlign) { lineX = floorf(lineX); lineY = floorf(lineY); }
+
+            if (item.doStroke) {
+                Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+                for (int ox = -1; ox <= 1; ox++) {
+                    for (int oy = -1; oy <= 1; oy++) {
+                        if (ox == 0 && oy == 0) continue;
+                        g.DrawString(lines[li].c_str(), -1, item.font,
+                            Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
+                            &strokeBrush);
+                    }
+                }
+            }
+
+            Gdiplus::SolidBrush textBrush(textColor);
+            g.DrawString(lines[li].c_str(), -1, item.font,
+                Gdiplus::PointF(lineX, lineY), &textBrush);
+        }
+    }
+}
+
+// Present hook — draws text on backbuffer, then calls original.
+// Pipeline: backbuffer → GetRenderTargetData → sysmem surface GDI+ draw
+// → UpdateSurface → default surface → StretchRect → backbuffer
+// This preserves the game's rendered content under the text overlay.
+static HRESULT __stdcall Present9Hook(IDirect3DDevice9* self, const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion)
+{
+    if (!g_textQueue.empty() && self && (!g_gameWindow || !IsIconic(g_gameWindow))) {
+        __try {
+            IDirect3DSurface9* backbuf = NULL;
+            if (SUCCEEDED(self->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuf)) && backbuf) {
+                D3DSURFACE_DESC desc;
+                backbuf->GetDesc(&desc);
+
+                if (EnsureTextSurfaces(self, desc.Width, desc.Height, desc.Format)) {
+                    // Copy game content from backbuffer (DEFAULT) → sysmem surface
+                    if (SUCCEEDED(self->GetRenderTargetData(backbuf, g_textSurfaceSys))) {
+                        HDC hdc = NULL;
+                        if (SUCCEEDED(g_textSurfaceSys->GetDC(&hdc)) && hdc) {
+                            RenderQueueOnDC(hdc);
+                            g_textSurfaceSys->ReleaseDC(hdc);
+
+                            // Copy back: sysmem → DEFAULT → backbuffer
+                            RECT rc = {0, 0, (LONG)desc.Width, (LONG)desc.Height};
+                            self->UpdateSurface(g_textSurfaceSys, &rc, g_textSurfaceDef, NULL);
+                            self->StretchRect(g_textSurfaceDef, &rc, backbuf, &rc, D3DTEXF_POINT);
+                        }
+                    }
+                }
+                backbuf->Release();
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            DebugLog("Present9Hook: exception");
+        }
+        g_textQueue.clear();
     }
 
-    DWORD* vtable = *(DWORD**)device;
-    g_origPresent = (PresentFn)vtable[17];
-    DWORD oldProtect;
-    VirtualProtect(&vtable[17], sizeof(DWORD), PAGE_READWRITE, &oldProtect);
-    vtable[17] = (DWORD)HookPresent;
-    VirtualProtect(&vtable[17], sizeof(DWORD), oldProtect, &oldProtect);
-    g_d3dHooked = true;
-    DebugLog("SetupD3DHook: Present hooked at vtable[17]");
+    return g_realPresent9(self, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+}
 
-    device->Release();
-    d3d->Release();
+static bool HookPresentVtable(IDirect3DDevice9* device)
+{
+    DWORD_PTR* vtbl = *(DWORD_PTR**)device;
+    DWORD oldProtect;
+    if (!VirtualProtect(&vtbl[17], sizeof(DWORD_PTR), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        DebugLog("HookPresentVtable: VirtualProtect failed");
+        return false;
+    }
+    g_realPresent9 = (Present9_t)vtbl[17];
+    vtbl[17] = (DWORD_PTR)Present9Hook;
+    VirtualProtect(&vtbl[17], sizeof(DWORD_PTR), oldProtect, &oldProtect);
+    DebugLog("HookPresentVtable: patched vt[17] old=%p", g_realPresent9);
+    return true;
+}
+
+// Verify a potential D3D9 device by checking its vtable belongs to d3d9.dll.
+static bool IsValidD3D9Device(IDirect3DDevice9* device)
+{
+    if (!device) return false;
+    HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
+    if (!hD3D9) return false;
+
+    DWORD_PTR* vtbl = *(DWORD_PTR**)device;
+    if (!vtbl) return false;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void*)vtbl[0], &mbi, sizeof(mbi))) return false;
+    return (mbi.AllocationBase == (void*)hD3D9);
+}
+
+// Try to find an already-existing D3D9 device (created by the gm82dx9
+// DirectX9 extension which runs in DllMain before FWInit).
+static bool TryFindD3D9Device()
+{
+    HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
+    if (!hD3D9) {
+        DebugLog("TryFindD3D9Device: d3d9.dll not loaded");
+        return false;
+    }
+
+    // gm82dx9 stores the game's D3D9 device pointer at fixed address
+    // 0x6886a8 (gm82vp.exe has no ASLR).
+    IDirect3DDevice9* device = NULL;
+    __try {
+        device = *(IDirect3DDevice9**)0x6886a8;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DebugLog("TryFindD3D9Device: access violation reading 0x6886a8");
+        return false;
+    }
+
+    if (!IsValidD3D9Device(device)) {
+        DebugLog("TryFindD3D9Device: pointer @0x6886a8 = %p invalid", device);
+        return false;
+    }
+
+    g_d3d9Device = device;
+    DebugLog("TryFindD3D9Device: found device=%p", device);
+    return HookPresentVtable(device);
 }
 
 // ── FWSetViewSize ──────────────────────────────────────────
@@ -263,13 +340,13 @@ DOUBLE WINAPI FWInit(DOUBLE sprite, DOUBLE argList)
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &g_gdiplusStartupInput, NULL);
     g_gameWindow = FindGameWindow();
     DebugLog("Found game window: %p", g_gameWindow);
-    SetupD3DHook();
     g_fontCount = 0;
     g_currentFont = NULL;
     g_halign = 0;
     g_valign = 0;
     g_lineSpacing = 0.0f;
     g_pixelAlign = false;
+    TryFindD3D9Device();
     return TRUE;
 }
 
@@ -282,6 +359,8 @@ DOUBLE WINAPI FWReleaseCache()
 DOUBLE WINAPI FWCleanup()
 {
     g_textQueue.clear();
+    SAFE_RELEASE(g_textSurfaceSys);
+    SAFE_RELEASE(g_textSurfaceDef);
     g_currentFont = NULL;
     for (auto& pair : g_fontMap) {
         FontInfo* fi = pair.second;
@@ -576,7 +655,10 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
     }
     if (!g_gameWindow || !IsWindow(g_gameWindow)) return;
 
-    if (!g_d3dHooked) return;
+    // Lazy init: try to find D3D9 device once per frame if missing
+    if (!g_d3d9Device) {
+        TryFindD3D9Device();
+    }
 
     TextDrawItem item;
     item.text = wstr;
@@ -639,6 +721,14 @@ DOUBLE WINAPI FWDrawTextTransformedColorEx(DOUBLE x, DOUBLE y, LPCSTR str)
 
 DOUBLE WINAPI FWPaint()
 {
+    if (!g_d3d9Device && !g_textQueue.empty() && g_gameWindow && IsWindow(g_gameWindow)) {
+        HDC hdc = GetDC(g_gameWindow);
+        if (hdc) {
+            RenderQueueOnDC(hdc);
+            ReleaseDC(g_gameWindow, hdc);
+        }
+        g_textQueue.clear();
+    }
     return TRUE;
 }
 

@@ -9,6 +9,8 @@
 *.ilk
 *.exp
 *.lib
+D3D9Proxy/
+msimg32.dll
 *.lastbuildstate
 unsuccessfulbuild
 Release/
