@@ -98,6 +98,22 @@ static std::vector<std::wstring> SplitLines(const std::wstring& text)
     return lines;
 }
 
+static Gdiplus::TextRenderingHint GetDrawHint(Gdiplus::Font* font)
+{
+    if (!font) return Gdiplus::TextRenderingHintAntiAliasGridFit;
+    return (font->GetSize() <= 20.0f)
+        ? Gdiplus::TextRenderingHintClearTypeGridFit
+        : Gdiplus::TextRenderingHintAntiAliasGridFit;
+}
+
+static Gdiplus::TextRenderingHint GetMeasureHint(Gdiplus::Font* font)
+{
+    if (!font) return Gdiplus::TextRenderingHintAntiAliasGridFit;
+    return (font->GetSize() <= 15.0f)
+        ? Gdiplus::TextRenderingHintClearTypeGridFit
+        : Gdiplus::TextRenderingHintAntiAliasGridFit;
+}
+
 struct TextDrawItem {
     std::wstring text;
     float x, y;
@@ -167,12 +183,17 @@ static void RenderQueueOnDC(HDC hdc)
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
     g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+    Gdiplus::StringFormat typoFmt(Gdiplus::StringFormat::GenericTypographic());
+    typoFmt.SetAlignment(Gdiplus::StringAlignmentNear);
+    typoFmt.SetLineAlignment(Gdiplus::StringAlignmentNear);
 
     for (size_t i = 0; i < g_textQueue.size(); i++) {
         const TextDrawItem& item = g_textQueue[i];
         if (item.text.empty() || !item.font) continue;
+
+        g.SetTextRenderingHint(GetDrawHint(item.font));
 
         BYTE a = (BYTE)(item.alpha * 255.0f);
         BYTE r = (item.color >> 16) & 0xFF;
@@ -189,7 +210,7 @@ static void RenderQueueOnDC(HDC hdc)
 
         Gdiplus::RectF bounds;
         g.MeasureString(lines[0].c_str(), -1, item.font,
-            Gdiplus::PointF(0, 0), &bounds);
+            Gdiplus::PointF(0, 0), &typoFmt, &bounds);
         float lineH = bounds.Height + item.lineSpacing;
         float totalH = (float)lines.size() * lineH - item.lineSpacing;
 
@@ -204,7 +225,7 @@ static void RenderQueueOnDC(HDC hdc)
             if (item.halign != 0) {
                 Gdiplus::RectF lb;
                 g.MeasureString(lines[li].c_str(), -1, item.font,
-                    Gdiplus::PointF(0, 0), &lb);
+                    Gdiplus::PointF(0, 0), &typoFmt, &lb);
                 if (item.halign == 1) lineX = fx - lb.Width / 2.0f;
                 else if (item.halign == 2) lineX = fx - lb.Width;
             }
@@ -218,14 +239,14 @@ static void RenderQueueOnDC(HDC hdc)
                         if (ox == 0 && oy == 0) continue;
                         g.DrawString(lines[li].c_str(), -1, item.font,
                             Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
-                            &strokeBrush);
+                            &typoFmt, &strokeBrush);
                     }
                 }
             }
 
             Gdiplus::SolidBrush textBrush(textColor);
             g.DrawString(lines[li].c_str(), -1, item.font,
-                Gdiplus::PointF(lineX, lineY), &textBrush);
+                Gdiplus::PointF(lineX, lineY), &typoFmt, &textBrush);
         }
     }
 }
@@ -580,8 +601,13 @@ DOUBLE WINAPI FWStringWidth(LPCSTR str)
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetTextRenderingHint(GetMeasureHint(font));
+    Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
+    fmt.SetAlignment(Gdiplus::StringAlignmentNear);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentNear);
     Gdiplus::RectF bounds;
-    g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+    g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &fmt, &bounds);
     ReleaseDC(NULL, hdc);
     return bounds.Width;
 }
@@ -599,8 +625,13 @@ DOUBLE WINAPI FWStringHeight(LPCSTR str)
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetTextRenderingHint(GetMeasureHint(font));
+    Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
+    fmt.SetAlignment(Gdiplus::StringAlignmentNear);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentNear);
     Gdiplus::RectF bounds;
-    g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+    g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &fmt, &bounds);
     float lineH = bounds.Height + g_lineSpacing;
     ReleaseDC(NULL, hdc);
     return (float)lines.size() * lineH - g_lineSpacing;
@@ -615,8 +646,12 @@ DOUBLE WINAPI FWStringWidthEx(LPCSTR str, DOUBLE sep, DOUBLE w)
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetTextRenderingHint(GetMeasureHint(GetGdiFont()));
 
-    Gdiplus::StringFormat fmt;
+    Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
+    fmt.SetAlignment(Gdiplus::StringAlignmentNear);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentNear);
     Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
     Gdiplus::RectF bounds;
     g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
@@ -633,8 +668,12 @@ DOUBLE WINAPI FWStringHeightEx(LPCSTR str, DOUBLE sep, DOUBLE w)
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetTextRenderingHint(GetMeasureHint(GetGdiFont()));
 
-    Gdiplus::StringFormat fmt;
+    Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
+    fmt.SetAlignment(Gdiplus::StringAlignmentNear);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentNear);
     Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
     Gdiplus::RectF bounds;
     g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
