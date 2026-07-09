@@ -36,7 +36,6 @@ extern HWND g_gameWindow;
 extern int g_drawColor1;
 extern int g_drawColor2;
 extern double g_drawAlpha;
-extern HDC g_lastDC;
 
 extern "C"
 {
