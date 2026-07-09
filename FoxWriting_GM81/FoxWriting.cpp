@@ -40,9 +40,6 @@ static HWND FindGameWindow()
 {
     DWORD pid = GetCurrentProcessId();
 
-    // Scan all top-level windows; pick the visible one with largest client area.
-    // The game runs in TRunnerForm (an owned window of TApplication), which has
-    // non-zero client area vs TApplication itself which may be 0x0 in IDE mode.
     HWND bestWnd = NULL;
     LONG bestArea = 0;
     HWND hwnd = NULL;
@@ -69,7 +66,6 @@ static std::wstring AnsiToWide(LPCSTR input)
     if (!input || !*input) return L"";
     int len = MultiByteToWideChar(g_codePage, 0, input, -1, NULL, 0);
     if (len <= 0) {
-        // Fallback to ACP
         len = MultiByteToWideChar(CP_ACP, 0, input, -1, NULL, 0);
         if (len <= 0) return L"";
     }
@@ -78,10 +74,180 @@ static std::wstring AnsiToWide(LPCSTR input)
     return result;
 }
 
+// ── Scaling ────────────────────────────────────────────────
+// Returns the uniform scale factor from view coords -> client pixels.
+// Also outputs the client area size.
+static float GetViewScale(int* outClientW, int* outClientH)
+{
+    if (!g_gameWindow || !IsWindow(g_gameWindow)) {
+        g_gameWindow = FindGameWindow();
+    }
+    RECT rc = {0, 0, g_viewWidth, g_viewHeight};
+    if (g_gameWindow) {
+        GetClientRect(g_gameWindow, &rc);
+    }
+    int cw = max(1, rc.right - rc.left);
+    int ch = max(1, rc.bottom - rc.top);
+    if (outClientW) *outClientW = cw;
+    if (outClientH) *outClientH = ch;
+    float sx = (float)cw / (float)max(1, g_viewWidth);
+    float sy = (float)ch / (float)max(1, g_viewHeight);
+    return min(sx, sy);
+}
+
+// ── Multi-line helpers ─────────────────────────────────────
+// Split a wide string on '\n' and return lines.
+// Each line is trimmed of trailing '\r'.
+static std::vector<std::wstring> SplitLines(const std::wstring& text)
+{
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(text);
+    std::wstring line;
+    while (std::getline(ss, line, L'\n')) {
+        if (!line.empty() && line.back() == L'\r')
+            line.pop_back();
+        lines.push_back(line);
+    }
+    if (lines.empty()) lines.push_back(L"");
+    return lines;
+}
+
+static Gdiplus::Font* GetGdiFont();
+
+// ── Core draw function ─────────────────────────────────────
+static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
+{
+    Gdiplus::Font* font = GetGdiFont();
+    if (!font) return;
+
+    bool empty = (!str || !*str);
+    std::wstring wstr;
+    if (!empty) {
+        wstr = AnsiToWide(str);
+        if (wstr.empty()) empty = true;
+    }
+
+    if (!g_gameWindow || !IsWindow(g_gameWindow)) {
+        g_gameWindow = FindGameWindow();
+    }
+    if (!g_gameWindow || !IsWindow(g_gameWindow)) return;
+
+    // Skip rendering when minimized
+    if (IsIconic(g_gameWindow)) return;
+
+    HDC hdc = GetDC(g_gameWindow);
+    if (!hdc) return;
+
+    {
+        Gdiplus::Graphics g(hdc);
+        g.SetPageUnit(Gdiplus::UnitPixel);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+
+        // Set text rendering hint based on font size
+        Gdiplus::REAL fontSize = font->GetSize();
+        g.SetTextRenderingHint(fontSize <= 20.0f
+            ? Gdiplus::TextRenderingHintClearTypeGridFit
+            : Gdiplus::TextRenderingHintAntiAliasGridFit);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+        // Apply view scaling
+        int clientW, clientH;
+        float scale = GetViewScale(&clientW, &clientH);
+
+        // Compute offsets to center/align the viewport in the client area
+        float offsetX = 0, offsetY = 0;
+        float scaledViewW = (float)g_viewWidth * scale;
+        float scaledViewH = (float)g_viewHeight * scale;
+        if (g_halign == 1) offsetX = ((float)clientW - scaledViewW) / 2.0f;
+        else if (g_halign == 2) offsetX = (float)clientW - scaledViewW;
+        if (g_valign == 1) offsetY = ((float)clientH - scaledViewH) / 2.0f;
+        else if (g_valign == 2) offsetY = (float)clientH - scaledViewH;
+
+        // Translate to the viewport origin in client space, then apply scale
+        Gdiplus::Matrix matrix;
+        matrix.Translate(offsetX, offsetY);
+        matrix.Scale(scale, scale);
+        g.SetTransform(&matrix);
+
+        if (!empty) {
+            BYTE a = (BYTE)(alpha * 255.0f);
+            BYTE r = (color >> 16) & 0xFF;
+            BYTE gr = (color >> 8) & 0xFF;
+            BYTE b = color & 0xFF;
+            Gdiplus::Color textColor(a, r, gr, b);
+
+            float fx = (float)x + (g_currentFont ? g_currentFont->xOffset : 0);
+            float fy = (float)y + (g_currentFont ? g_currentFont->yOffset : 0);
+            if (g_pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
+
+            // Split into lines
+            auto lines = SplitLines(wstr);
+            if (lines.empty()) return;
+
+            // Measure first line for line height
+            Gdiplus::RectF bounds;
+            g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+            float lineH = bounds.Height + g_lineSpacing;
+
+            // Total text block height for vertical alignment
+            float totalH = (float)lines.size() * lineH - g_lineSpacing;
+
+            // Apply alignment for the whole block
+            float drawY = fy;
+            if (g_valign == 1) drawY = fy - totalH / 2.0f;
+            else if (g_valign == 2) drawY = fy - totalH;
+
+            bool doStroke = g_currentFont && g_currentFont->stroke;
+
+            for (size_t i = 0; i < lines.size(); i++) {
+                float lineX = fx;
+                float lineY = drawY + (float)i * lineH;
+
+                // Horizontal alignment per line
+                if (g_halign != 0) {
+                    Gdiplus::RectF lineBounds;
+                    g.MeasureString(lines[i].c_str(), -1, font,
+                        Gdiplus::PointF(0, 0), &lineBounds);
+                    if (g_halign == 1) lineX = fx - lineBounds.Width / 2.0f;
+                    else if (g_halign == 2) lineX = fx - lineBounds.Width;
+                }
+
+                if (g_pixelAlign) { lineX = floorf(lineX); lineY = floorf(lineY); }
+
+                if (doStroke) {
+                    Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+                    for (int ox = -1; ox <= 1; ox++) {
+                        for (int oy = -1; oy <= 1; oy++) {
+                            if (ox == 0 && oy == 0) continue;
+                            g.DrawString(lines[i].c_str(), -1, font,
+                                Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
+                                &strokeBrush);
+                        }
+                    }
+                }
+
+                Gdiplus::SolidBrush textBrush(textColor);
+                g.DrawString(lines[i].c_str(), -1, font,
+                    Gdiplus::PointF(lineX, lineY), &textBrush);
+            }
+        }
+    }
+
+    ReleaseDC(g_gameWindow, hdc);
+}
+
+static Gdiplus::Font* GetGdiFont()
+{
+    if (!g_currentFont || !g_currentFont->font) return NULL;
+    return g_currentFont->font;
+}
+
+// ── Exported functions ─────────────────────────────────────
+
 DOUBLE WINAPI FWSetViewSize(DOUBLE w, DOUBLE h)
 {
-    g_viewWidth = (int)w;
-    g_viewHeight = (int)h;
+    g_viewWidth = max(1, (int)w);
+    g_viewHeight = max(1, (int)h);
     DebugLog("FWSetViewSize(%d, %d)", g_viewWidth, g_viewHeight);
     return TRUE;
 }
@@ -164,7 +330,7 @@ DOUBLE WINAPI FWAddFont(LPCSTR name, DOUBLE pt, DOUBLE style)
         delete family;
         return -1;
     }
-    int gdiStyle = (int)style & 0x03; // strip FoxWriting stroke flag (0x4)
+    int gdiStyle = (int)style & 0x03;
     bool stroke = ((int)style & 0x04) != 0;
     Gdiplus::Font* font = new Gdiplus::Font(family, (Gdiplus::REAL)pt,
         gdiStyle, Gdiplus::UnitPoint);
@@ -190,7 +356,7 @@ DOUBLE WINAPI FWAddFontFromFile(LPCSTR ttf, DOUBLE pt, DOUBLE style)
     Gdiplus::Font* font = NULL;
     Gdiplus::FontFamily* family = NULL;
 
-    int gdiStyle = (int)style & 0x03; // strip FoxWriting stroke flag (0x4)
+    int gdiStyle = (int)style & 0x03;
     bool stroke = ((int)style & 0x04) != 0;
 
     Gdiplus::PrivateFontCollection* pfc = new Gdiplus::PrivateFontCollection();
@@ -213,12 +379,11 @@ DOUBLE WINAPI FWAddFontFromFile(LPCSTR ttf, DOUBLE pt, DOUBLE style)
     }
 
     if (!font) {
-        // Try direct path
         DebugLog("FWAddFontFromFile: trying direct path");
         font = new Gdiplus::Font(wpath.c_str(), (Gdiplus::REAL)pt,
             gdiStyle, Gdiplus::UnitPoint);
         if (font && font->GetLastStatus() == Gdiplus::Ok) {
-            family = NULL; // Font owns the family reference
+            family = NULL;
             DebugLog("FWAddFontFromFile: direct path OK");
         } else {
             Gdiplus::Status st = font ? font->GetLastStatus() : Gdiplus::NotImplemented;
@@ -310,12 +475,6 @@ DOUBLE WINAPI FWSetLineSpacing(DOUBLE sep)
     return TRUE;
 }
 
-static Gdiplus::Font* GetGdiFont()
-{
-    if (!g_currentFont || !g_currentFont->font) return NULL;
-    return g_currentFont->font;
-}
-
 DOUBLE WINAPI FWStringWidth(LPCSTR str)
 {
     Gdiplus::Font* font = GetGdiFont();
@@ -326,7 +485,6 @@ DOUBLE WINAPI FWStringWidth(LPCSTR str)
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
-    Gdiplus::RectF layout(0, 0, 0, 0);
     Gdiplus::RectF bounds;
     g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
     ReleaseDC(NULL, hdc);
@@ -340,99 +498,59 @@ DOUBLE WINAPI FWStringHeight(LPCSTR str)
     std::wstring wstr = AnsiToWide(str);
     if (wstr.empty()) return 0;
 
+    // Split into lines for multi-line height
+    auto lines = SplitLines(wstr);
+    if (lines.empty()) return 0;
+
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
-    Gdiplus::RectF layout(0, 0, 0, 0);
     Gdiplus::RectF bounds;
-    g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+    g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+    float lineH = bounds.Height + g_lineSpacing;
     ReleaseDC(NULL, hdc);
-    return bounds.Height;
+    return (float)lines.size() * lineH - g_lineSpacing;
 }
 
 DOUBLE WINAPI FWStringWidthEx(LPCSTR str, DOUBLE sep, DOUBLE w)
 {
-    return FWStringWidth(str);
+    // Measure the widest line (wrapping at width w)
+    if (!GetGdiFont()) return FWStringWidth(str);
+    std::wstring wstr = AnsiToWide(str);
+    if (wstr.empty()) return 0;
+
+    HDC hdc = GetDC(NULL);
+    Gdiplus::Graphics g(hdc);
+    g.SetPageUnit(Gdiplus::UnitPixel);
+
+    Gdiplus::StringFormat fmt;
+    fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
+    Gdiplus::RectF bounds;
+    g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
+    ReleaseDC(NULL, hdc);
+    return bounds.Width;
 }
 
 DOUBLE WINAPI FWStringHeightEx(LPCSTR str, DOUBLE sep, DOUBLE w)
 {
-    return FWStringHeight(str);
+    if (!GetGdiFont()) return FWStringHeight(str);
+    std::wstring wstr = AnsiToWide(str);
+    if (wstr.empty()) return 0;
+
+    HDC hdc = GetDC(NULL);
+    Gdiplus::Graphics g(hdc);
+    g.SetPageUnit(Gdiplus::UnitPixel);
+
+    Gdiplus::StringFormat fmt;
+    Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
+    Gdiplus::RectF bounds;
+    g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
+    ReleaseDC(NULL, hdc);
+    return bounds.Height;
 }
 
-// Draw text directly to the game window's HDC using GDI+.
-// The text is drawn on top of the D3D content each frame.
-static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
-{
-    Gdiplus::Font* font = GetGdiFont();
-    if (!font) return;
-
-    bool empty = (!str || !*str);
-    std::wstring wstr;
-    if (!empty) {
-        wstr = AnsiToWide(str);
-        if (wstr.empty()) empty = true;
-    }
-
-    if (!g_gameWindow || !IsWindow(g_gameWindow)) {
-        g_gameWindow = FindGameWindow();
-    }
-    if (!g_gameWindow || !IsWindow(g_gameWindow)) return;
-
-    HDC hdc = GetDC(g_gameWindow);
-    if (!hdc) return;
-
-    // Draw on game window DC — text persists on screen until next D3D Present
-    {
-        Gdiplus::Graphics g(hdc);
-        g.SetPageUnit(Gdiplus::UnitPixel);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-        Gdiplus::REAL fontSize = font->GetSize();
-        g.SetTextRenderingHint(fontSize <= 20.0f
-            ? Gdiplus::TextRenderingHintClearTypeGridFit
-            : Gdiplus::TextRenderingHintAntiAliasGridFit);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-
-        if (!empty) {
-            BYTE a = (BYTE)(alpha * 255.0f);
-            BYTE r = (color >> 16) & 0xFF;
-            BYTE gr = (color >> 8) & 0xFF;
-            BYTE b = color & 0xFF;
-
-            float fx = (float)x + (g_currentFont ? g_currentFont->xOffset : 0);
-            float fy = (float)y + (g_currentFont ? g_currentFont->yOffset : 0);
-            if (g_pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
-
-            Gdiplus::RectF bounds;
-            g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
-
-            Gdiplus::PointF pt(fx, fy);
-            if (g_valign == 1) pt.Y = fy - bounds.Height / 2.0f;
-            else if (g_valign == 2) pt.Y = fy - bounds.Height;
-            if (g_halign == 1) pt.X = fx - bounds.Width / 2.0f;
-            else if (g_halign == 2) pt.X = fx - bounds.Width;
-
-            // Stroke: 8-dir offset black outline
-            bool doStroke = g_currentFont && g_currentFont->stroke;
-            if (doStroke) {
-                Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-                for (int ox = -1; ox <= 1; ox++) {
-                    for (int oy = -1; oy <= 1; oy++) {
-                        if (ox == 0 && oy == 0) continue;
-                        g.DrawString(wstr.c_str(), -1, font,
-                            Gdiplus::PointF(pt.X + (float)ox, pt.Y + (float)oy),
-                            &strokeBrush);
-                    }
-                }
-            }
-
-            Gdiplus::SolidBrush textBrush(Gdiplus::Color(a, r, gr, b));
-            g.DrawString(wstr.c_str(), -1, font, pt, &textBrush);
-        }
-    }
-
-    ReleaseDC(g_gameWindow, hdc);
-}
+// ── Draw text variants ─────────────────────────────────────
 
 DOUBLE WINAPI FWDrawText(DOUBLE x, DOUBLE y, LPCSTR str)
 {
