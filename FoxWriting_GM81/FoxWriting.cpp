@@ -488,7 +488,8 @@ DOUBLE WINAPI FWStringWidth(LPCSTR str)
     Gdiplus::RectF bounds;
     g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
     ReleaseDC(NULL, hdc);
-    return bounds.Width;
+    float scale = GetViewScale(NULL, NULL);
+    return bounds.Width * scale;
 }
 
 DOUBLE WINAPI FWStringHeight(LPCSTR str)
@@ -498,7 +499,6 @@ DOUBLE WINAPI FWStringHeight(LPCSTR str)
     std::wstring wstr = AnsiToWide(str);
     if (wstr.empty()) return 0;
 
-    // Split into lines for multi-line height
     auto lines = SplitLines(wstr);
     if (lines.empty()) return 0;
 
@@ -509,27 +509,30 @@ DOUBLE WINAPI FWStringHeight(LPCSTR str)
     g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
     float lineH = bounds.Height + g_lineSpacing;
     ReleaseDC(NULL, hdc);
-    return (float)lines.size() * lineH - g_lineSpacing;
+    float scale = GetViewScale(NULL, NULL);
+    return ((float)lines.size() * lineH - g_lineSpacing) * scale;
 }
 
 DOUBLE WINAPI FWStringWidthEx(LPCSTR str, DOUBLE sep, DOUBLE w)
 {
-    // Measure the widest line (wrapping at width w)
     if (!GetGdiFont()) return FWStringWidth(str);
     std::wstring wstr = AnsiToWide(str);
     if (wstr.empty()) return 0;
+
+    float scale = GetViewScale(NULL, NULL);
+    Gdiplus::REAL wrapW = (Gdiplus::REAL)w;
+    if (scale > 0.001f) wrapW = (Gdiplus::REAL)(w / scale);
 
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
 
     Gdiplus::StringFormat fmt;
-    fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
+    Gdiplus::RectF layout(0, 0, wrapW, 10000);
     Gdiplus::RectF bounds;
     g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
     ReleaseDC(NULL, hdc);
-    return bounds.Width;
+    return bounds.Width * scale;
 }
 
 DOUBLE WINAPI FWStringHeightEx(LPCSTR str, DOUBLE sep, DOUBLE w)
@@ -538,16 +541,20 @@ DOUBLE WINAPI FWStringHeightEx(LPCSTR str, DOUBLE sep, DOUBLE w)
     std::wstring wstr = AnsiToWide(str);
     if (wstr.empty()) return 0;
 
+    float scale = GetViewScale(NULL, NULL);
+    Gdiplus::REAL wrapW = (Gdiplus::REAL)w;
+    if (scale > 0.001f) wrapW = (Gdiplus::REAL)(w / scale);
+
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
 
     Gdiplus::StringFormat fmt;
-    Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
+    Gdiplus::RectF layout(0, 0, wrapW, 10000);
     Gdiplus::RectF bounds;
     g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
     ReleaseDC(NULL, hdc);
-    return bounds.Height;
+    return bounds.Height * scale;
 }
 
 // ── Draw text variants ─────────────────────────────────────
