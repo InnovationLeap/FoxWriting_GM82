@@ -29,4 +29,3 @@ EXPORTS
     FWPaint
     FWWindowResized
     FWSetViewSize
-    FWSetTextColor
