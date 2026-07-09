@@ -173,104 +173,96 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
 
     if (IsIconic(g_gameWindow)) return;
 
-    HDC winDC = GetDC(g_gameWindow);
-    if (!winDC) return;
-
     int clientW, clientH;
     float scale = GetViewScale(&clientW, &clientH);
 
-    EnsureAlphaDIB(clientW, clientH);
-    if (!g_memDib || !g_memBits) { ReleaseDC(g_gameWindow, winDC); return; }
+    // Create GDI+ Bitmap with per-pixel alpha
+    Gdiplus::Bitmap bmp(clientW, clientH, PixelFormat32bppARGB);
+    Gdiplus::Graphics g(&bmp);
+    g.SetPageUnit(Gdiplus::UnitPixel);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    g.Clear(Gdiplus::Color(0, 0, 0, 0)); // transparent
 
-    // Clear to transparent
-    memset(g_memBits, 0, (size_t)clientW * clientH * 4);
+    float offsetX = 0, offsetY = 0;
+    float scaledViewW = (float)g_viewWidth * scale;
+    float scaledViewH = (float)g_viewHeight * scale;
+    if (g_halign == 1) offsetX = ((float)clientW - scaledViewW) / 2.0f;
+    else if (g_halign == 2) offsetX = (float)clientW - scaledViewW;
+    if (g_valign == 1) offsetY = ((float)clientH - scaledViewH) / 2.0f;
+    else if (g_valign == 2) offsetY = (float)clientH - scaledViewH;
 
-    {
-        Gdiplus::Graphics g(g_memDC);
-        g.SetPageUnit(Gdiplus::UnitPixel);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    Gdiplus::Matrix matrix;
+    matrix.Translate(offsetX, offsetY);
+    matrix.Scale(scale, scale);
+    g.SetTransform(&matrix);
 
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    if (!empty) {
+        BYTE a = (BYTE)(alpha * 255.0f);
+        BYTE r = (color >> 16) & 0xFF;
+        BYTE gr = (color >> 8) & 0xFF;
+        BYTE b = color & 0xFF;
+        Gdiplus::Color textColor(a, r, gr, b);
 
-        float offsetX = 0, offsetY = 0;
-        float scaledViewW = (float)g_viewWidth * scale;
-        float scaledViewH = (float)g_viewHeight * scale;
-        if (g_halign == 1) offsetX = ((float)clientW - scaledViewW) / 2.0f;
-        else if (g_halign == 2) offsetX = (float)clientW - scaledViewW;
-        if (g_valign == 1) offsetY = ((float)clientH - scaledViewH) / 2.0f;
-        else if (g_valign == 2) offsetY = (float)clientH - scaledViewH;
+        float fx = (float)x + (g_currentFont ? g_currentFont->xOffset : 0);
+        float fy = (float)y + (g_currentFont ? g_currentFont->yOffset : 0);
+        if (g_pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
 
-        Gdiplus::Matrix matrix;
-        matrix.Translate(offsetX, offsetY);
-        matrix.Scale(scale, scale);
-        g.SetTransform(&matrix);
+        auto lines = SplitLines(wstr);
+        if (!lines.empty()) {
+            Gdiplus::RectF bounds;
+            g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+            float lineH = bounds.Height + g_lineSpacing;
+            float totalH = (float)lines.size() * lineH - g_lineSpacing;
 
-        if (!empty) {
-            BYTE a = (BYTE)(alpha * 255.0f);
-            BYTE r = (color >> 16) & 0xFF;
-            BYTE gr = (color >> 8) & 0xFF;
-            BYTE b = color & 0xFF;
-            Gdiplus::Color textColor(a, r, gr, b);
+            float drawY = fy;
+            if (g_valign == 1) drawY = fy - totalH / 2.0f;
+            else if (g_valign == 2) drawY = fy - totalH;
 
-            float fx = (float)x + (g_currentFont ? g_currentFont->xOffset : 0);
-            float fy = (float)y + (g_currentFont ? g_currentFont->yOffset : 0);
-            if (g_pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
+            bool doStroke = g_currentFont && g_currentFont->stroke;
 
-            auto lines = SplitLines(wstr);
-            if (!lines.empty()) {
-                Gdiplus::RectF bounds;
-                g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
-                float lineH = bounds.Height + g_lineSpacing;
-                float totalH = (float)lines.size() * lineH - g_lineSpacing;
+            for (size_t i = 0; i < lines.size(); i++) {
+                float lineX = fx;
+                float lineY = drawY + (float)i * lineH;
 
-                float drawY = fy;
-                if (g_valign == 1) drawY = fy - totalH / 2.0f;
-                else if (g_valign == 2) drawY = fy - totalH;
+                if (g_halign != 0) {
+                    Gdiplus::RectF lineBounds;
+                    g.MeasureString(lines[i].c_str(), -1, font,
+                        Gdiplus::PointF(0, 0), &lineBounds);
+                    if (g_halign == 1) lineX = fx - lineBounds.Width / 2.0f;
+                    else if (g_halign == 2) lineX = fx - lineBounds.Width;
+                }
 
-                bool doStroke = g_currentFont && g_currentFont->stroke;
+                if (g_pixelAlign) { lineX = floorf(lineX); lineY = floorf(lineY); }
 
-                for (size_t i = 0; i < lines.size(); i++) {
-                    float lineX = fx;
-                    float lineY = drawY + (float)i * lineH;
-
-                    if (g_halign != 0) {
-                        Gdiplus::RectF lineBounds;
-                        g.MeasureString(lines[i].c_str(), -1, font,
-                            Gdiplus::PointF(0, 0), &lineBounds);
-                        if (g_halign == 1) lineX = fx - lineBounds.Width / 2.0f;
-                        else if (g_halign == 2) lineX = fx - lineBounds.Width;
-                    }
-
-                    if (g_pixelAlign) { lineX = floorf(lineX); lineY = floorf(lineY); }
-
-                    if (doStroke) {
-                        Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-                        for (int ox = -1; ox <= 1; ox++) {
-                            for (int oy = -1; oy <= 1; oy++) {
-                                if (ox == 0 && oy == 0) continue;
-                                g.DrawString(lines[i].c_str(), -1, font,
-                                    Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
-                                    &strokeBrush);
-                            }
+                if (doStroke) {
+                    Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+                    for (int ox = -1; ox <= 1; ox++) {
+                        for (int oy = -1; oy <= 1; oy++) {
+                            if (ox == 0 && oy == 0) continue;
+                            g.DrawString(lines[i].c_str(), -1, font,
+                                Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
+                                &strokeBrush);
                         }
                     }
-
-                    Gdiplus::SolidBrush textBrush(textColor);
-                    g.DrawString(lines[i].c_str(), -1, font,
-                        Gdiplus::PointF(lineX, lineY), &textBrush);
                 }
+
+                Gdiplus::SolidBrush textBrush(textColor);
+                g.DrawString(lines[i].c_str(), -1, font,
+                    Gdiplus::PointF(lineX, lineY), &textBrush);
             }
         }
     }
 
-    BLENDFUNCTION blend = {0};
-    blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
-    blend.AlphaFormat = AC_SRC_ALPHA;
-    AlphaBlend(winDC, 0, 0, clientW, clientH, g_memDC, 0, 0, clientW, clientH, blend);
-
-    ReleaseDC(g_gameWindow, winDC);
+    // Draw the ARGB bitmap onto the window DC
+    HDC winDC = GetDC(g_gameWindow);
+    if (winDC) {
+        Gdiplus::Graphics winG(winDC);
+        winG.SetPageUnit(Gdiplus::UnitPixel);
+        winG.DrawImage(&bmp, 0, 0, clientW, clientH);
+        ReleaseDC(g_gameWindow, winDC);
+    }
 }
 
 static Gdiplus::Font* GetGdiFont()
