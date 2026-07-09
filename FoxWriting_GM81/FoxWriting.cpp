@@ -119,6 +119,7 @@ static HRESULT __stdcall HookPresent(
     HWND hDestWindowOverride,
     CONST RGNDATA* pDirtyRegion)
 {
+    DebugLog("HookPresent called, queue=%zu hooked=%d", g_textQueue.size(), g_d3dHooked);
     if (device && !g_textQueue.empty()) {
         if (!g_gameWindow || IsIconic(g_gameWindow)) {
             // Skip drawing when minimized
