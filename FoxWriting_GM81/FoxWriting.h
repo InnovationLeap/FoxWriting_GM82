@@ -13,11 +13,13 @@
 struct FontInfo {
     Gdiplus::Font* font;
     Gdiplus::FontFamily* family;
+    Gdiplus::PrivateFontCollection* pfc;
     std::wstring filePath;
     int style;
     float xOffset;
     float yOffset;
     bool fromFile;
+    bool stroke;
 };
 
 
@@ -67,6 +69,7 @@ extern "C"
     FOXWRITING_API DOUBLE WINAPI FWDrawTextTransformedColorEx(DOUBLE x, DOUBLE y, LPCSTR str);
     FOXWRITING_API DOUBLE WINAPI FWPaint();
     FOXWRITING_API DOUBLE WINAPI FWWindowResized();
+    FOXWRITING_API DOUBLE WINAPI FWSetViewSize(DOUBLE w, DOUBLE h);
 };
 
 #endif

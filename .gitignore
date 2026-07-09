@@ -1,0 +1,20 @@
+# Build artifacts
+*.obj
+*.pch
+*.tlog/
+*.log
+*.pdb
+*.ipdb
+*.iobj
+*.ilk
+*.exp
+*.lib
+*.lastbuildstate
+unsuccessfulbuild
+Release/
+Debug/
+.vs/
+*.sdf
+*.opensdf
+*.suo
+*.user
