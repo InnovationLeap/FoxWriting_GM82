@@ -81,12 +81,17 @@ static std::wstring AnsiToWide(LPCSTR input)
 
 static std::vector<std::wstring> SplitLines(const std::wstring& text)
 {
+    std::wstring s = text;
+    size_t pos = 0;
+    while ((pos = s.find(L"\r\n", 0)) != std::wstring::npos) {
+        s.replace(pos, 2, L"\n");
+    }
+    std::replace(s.begin(), s.end(), L'\r', L'\n');
+
     std::vector<std::wstring> lines;
-    std::wstringstream ss(text);
+    std::wstringstream ss(s);
     std::wstring line;
     while (std::getline(ss, line, L'\n')) {
-        if (!line.empty() && line.back() == L'\r')
-            line.pop_back();
         lines.push_back(line);
     }
     if (lines.empty()) lines.push_back(L"");
