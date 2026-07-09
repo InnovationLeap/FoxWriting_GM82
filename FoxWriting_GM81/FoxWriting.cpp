@@ -80,6 +80,20 @@ static std::wstring AnsiToWide(LPCSTR input)
     return result;
 }
 
+static std::vector<std::wstring> SplitLines(const std::wstring& text)
+{
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(text);
+    std::wstring line;
+    while (std::getline(ss, line, L'\n')) {
+        if (!line.empty() && line.back() == L'\r')
+            line.pop_back();
+        lines.push_back(line);
+    }
+    if (lines.empty()) lines.push_back(L"");
+    return lines;
+}
+
 // ── D3D9 Present hook ──────────────────────────────────────
 typedef HRESULT (__stdcall *PresentFn)(IDirect3DDevice9*, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
 static PresentFn g_origPresent = NULL;
@@ -93,6 +107,7 @@ struct TextDrawItem {
     Gdiplus::Font* font;
     int halign, valign;
     float xOffset, yOffset;
+    float lineSpacing;
     bool pixelAlign, doStroke;
 };
 static std::vector<TextDrawItem> g_textQueue;
@@ -104,56 +119,85 @@ static HRESULT __stdcall HookPresent(
     HWND hDestWindowOverride,
     CONST RGNDATA* pDirtyRegion)
 {
-    // Draw queued text to backbuffer before Present
     if (device && !g_textQueue.empty()) {
+        if (!g_gameWindow || IsIconic(g_gameWindow)) {
+            // Skip drawing when minimized
+            g_textQueue.clear();
+            return g_origPresent(device, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+        }
+
         LPDIRECT3DSURFACE9 backbuf = NULL;
         if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuf))) {
             HDC hdc = NULL;
             if (SUCCEEDED(backbuf->GetDC(&hdc))) {
+                Gdiplus::Graphics g(hdc);
+                g.SetPageUnit(Gdiplus::UnitPixel);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+                g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
                 for (size_t i = 0; i < g_textQueue.size(); i++) {
                     const TextDrawItem& item = g_textQueue[i];
                     if (item.text.empty() || !item.font) continue;
-                    Gdiplus::Graphics g(hdc);
-                    g.SetPageUnit(Gdiplus::UnitPixel);
-                    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-                    Gdiplus::REAL fontSize = item.font->GetSize();
-                    g.SetTextRenderingHint(fontSize <= 20.0f
-                        ? Gdiplus::TextRenderingHintClearTypeGridFit
-                        : Gdiplus::TextRenderingHintAntiAliasGridFit);
-                    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
 
                     BYTE a = (BYTE)(item.alpha * 255.0f);
                     BYTE r = (item.color >> 16) & 0xFF;
                     BYTE gr = (item.color >> 8) & 0xFF;
                     BYTE b = item.color & 0xFF;
+                    Gdiplus::Color textColor(a, r, gr, b);
 
                     float fx = item.x + item.xOffset;
                     float fy = item.y + item.yOffset;
                     if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
 
+                    auto lines = SplitLines(item.text);
+                    if (lines.empty()) continue;
+
                     Gdiplus::RectF bounds;
-                    g.MeasureString(item.text.c_str(), -1, item.font, Gdiplus::PointF(0,0), &bounds);
+                    g.MeasureString(lines[0].c_str(), -1, item.font,
+                        Gdiplus::PointF(0, 0), &bounds);
+                    float lineH = bounds.Height + item.lineSpacing;
+                    float totalH = (float)lines.size() * lineH - item.lineSpacing;
 
-                    Gdiplus::PointF pt(fx, fy);
-                    if (item.valign == 1) pt.Y = fy - bounds.Height / 2.0f;
-                    else if (item.valign == 2) pt.Y = fy - bounds.Height;
-                    if (item.halign == 1) pt.X = fx - bounds.Width / 2.0f;
-                    else if (item.halign == 2) pt.X = fx - bounds.Width;
+                    float drawY = fy;
+                    if (item.valign == 1) drawY = fy - totalH / 2.0f;
+                    else if (item.valign == 2) drawY = fy - totalH;
 
-                    if (item.doStroke) {
-                        Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-                        for (int ox = -1; ox <= 1; ox++) {
-                            for (int oy = -1; oy <= 1; oy++) {
-                                if (ox == 0 && oy == 0) continue;
-                                g.DrawString(item.text.c_str(), -1, item.font,
-                                    Gdiplus::PointF(pt.X + (float)ox, pt.Y + (float)oy),
-                                    &strokeBrush);
+                    bool doStroke = item.doStroke;
+
+                    for (size_t li = 0; li < lines.size(); li++) {
+                        float lineX = fx;
+                        float lineY = drawY + (float)li * lineH;
+
+                        if (item.halign != 0) {
+                            Gdiplus::RectF lb;
+                            g.MeasureString(lines[li].c_str(), -1, item.font,
+                                Gdiplus::PointF(0, 0), &lb);
+                            if (item.halign == 1) lineX = fx - lb.Width / 2.0f;
+                            else if (item.halign == 2) lineX = fx - lb.Width;
+                        }
+
+                        if (item.pixelAlign) {
+                            lineX = floorf(lineX);
+                            lineY = floorf(lineY);
+                        }
+
+                        if (doStroke) {
+                            Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+                            for (int ox = -1; ox <= 1; ox++) {
+                                for (int oy = -1; oy <= 1; oy++) {
+                                    if (ox == 0 && oy == 0) continue;
+                                    g.DrawString(lines[li].c_str(), -1, item.font,
+                                        Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
+                                        &strokeBrush);
+                                }
                             }
                         }
-                    }
 
-                    Gdiplus::SolidBrush textBrush(Gdiplus::Color(a, r, gr, b));
-                    g.DrawString(item.text.c_str(), -1, item.font, pt, &textBrush);
+                        Gdiplus::SolidBrush textBrush(textColor);
+                        g.DrawString(lines[li].c_str(), -1, item.font,
+                            Gdiplus::PointF(lineX, lineY), &textBrush);
+                    }
                 }
                 backbuf->ReleaseDC(hdc);
             }
@@ -451,7 +495,6 @@ DOUBLE WINAPI FWStringWidth(LPCSTR str)
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
-    Gdiplus::RectF layout(0, 0, 0, 0);
     Gdiplus::RectF bounds;
     g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
     ReleaseDC(NULL, hdc);
@@ -465,24 +508,53 @@ DOUBLE WINAPI FWStringHeight(LPCSTR str)
     std::wstring wstr = AnsiToWide(str);
     if (wstr.empty()) return 0;
 
+    auto lines = SplitLines(wstr);
+    if (lines.empty()) return 0;
+
     HDC hdc = GetDC(NULL);
     Gdiplus::Graphics g(hdc);
     g.SetPageUnit(Gdiplus::UnitPixel);
-    Gdiplus::RectF layout(0, 0, 0, 0);
     Gdiplus::RectF bounds;
-    g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+    g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+    float lineH = bounds.Height + g_lineSpacing;
     ReleaseDC(NULL, hdc);
-    return bounds.Height;
+    return (float)lines.size() * lineH - g_lineSpacing;
 }
 
 DOUBLE WINAPI FWStringWidthEx(LPCSTR str, DOUBLE sep, DOUBLE w)
 {
-    return FWStringWidth(str);
+    if (!GetGdiFont()) return FWStringWidth(str);
+    std::wstring wstr = AnsiToWide(str);
+    if (wstr.empty()) return 0;
+
+    HDC hdc = GetDC(NULL);
+    Gdiplus::Graphics g(hdc);
+    g.SetPageUnit(Gdiplus::UnitPixel);
+
+    Gdiplus::StringFormat fmt;
+    Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
+    Gdiplus::RectF bounds;
+    g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
+    ReleaseDC(NULL, hdc);
+    return bounds.Width;
 }
 
 DOUBLE WINAPI FWStringHeightEx(LPCSTR str, DOUBLE sep, DOUBLE w)
 {
-    return FWStringHeight(str);
+    if (!GetGdiFont()) return FWStringHeight(str);
+    std::wstring wstr = AnsiToWide(str);
+    if (wstr.empty()) return 0;
+
+    HDC hdc = GetDC(NULL);
+    Gdiplus::Graphics g(hdc);
+    g.SetPageUnit(Gdiplus::UnitPixel);
+
+    Gdiplus::StringFormat fmt;
+    Gdiplus::RectF layout(0, 0, (Gdiplus::REAL)w, 10000);
+    Gdiplus::RectF bounds;
+    g.MeasureString(wstr.c_str(), -1, GetGdiFont(), layout, &fmt, &bounds);
+    ReleaseDC(NULL, hdc);
+    return bounds.Height;
 }
 
 // Queue text items for D3D Present hook to render
@@ -516,6 +588,7 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
     item.valign = g_valign;
     item.xOffset = g_currentFont ? g_currentFont->xOffset : 0;
     item.yOffset = g_currentFont ? g_currentFont->yOffset : 0;
+    item.lineSpacing = g_lineSpacing;
     item.pixelAlign = g_pixelAlign;
     item.doStroke = g_currentFont ? g_currentFont->stroke : false;
     g_textQueue.push_back(item);
