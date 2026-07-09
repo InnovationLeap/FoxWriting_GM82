@@ -35,6 +35,45 @@ double g_drawAlpha = 1.0;
 static UINT g_codePage = CP_ACP;
 static int g_viewWidth = 800;
 static int g_viewHeight = 600;
+static WNDPROC g_origWndProc = NULL;
+static HDC g_memDC = NULL;
+static HBITMAP g_memDib = NULL;
+static void* g_memBits = NULL;
+static int g_memW = 0;
+static int g_memH = 0;
+
+static void EnsureAlphaDIB(int w, int h)
+{
+    if (g_memDib && g_memW >= w && g_memH >= h) return;
+    if (g_memDib) { DeleteObject(g_memDib); g_memDib = NULL; }
+    if (g_memDC) { DeleteDC(g_memDC); g_memDC = NULL; }
+    g_memBits = NULL;
+    HDC screenDC = GetDC(NULL);
+    g_memDC = CreateCompatibleDC(screenDC);
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    g_memDib = CreateDIBSection(screenDC, &bmi, DIB_RGB_COLORS, &g_memBits, NULL, 0);
+    ReleaseDC(NULL, screenDC);
+    if (g_memDC && g_memDib) {
+        SelectObject(g_memDC, g_memDib);
+        g_memW = w;
+        g_memH = h;
+    }
+}
+
+static LRESULT CALLBACK WindowSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return TRUE;
+    }
+    return CallWindowProcW(g_origWndProc, hwnd, msg, wParam, lParam);
+}
 
 static HWND FindGameWindow()
 {
@@ -132,29 +171,28 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
     }
     if (!g_gameWindow || !IsWindow(g_gameWindow)) return;
 
-    // Skip rendering when minimized
     if (IsIconic(g_gameWindow)) return;
 
-    HDC hdc = GetDC(g_gameWindow);
-    if (!hdc) return;
+    HDC winDC = GetDC(g_gameWindow);
+    if (!winDC) return;
+
+    int clientW, clientH;
+    float scale = GetViewScale(&clientW, &clientH);
+
+    EnsureAlphaDIB(clientW, clientH);
+    if (!g_memDib || !g_memBits) { ReleaseDC(g_gameWindow, winDC); return; }
+
+    // Clear to transparent
+    memset(g_memBits, 0, (size_t)clientW * clientH * 4);
 
     {
-        Gdiplus::Graphics g(hdc);
+        Gdiplus::Graphics g(g_memDC);
         g.SetPageUnit(Gdiplus::UnitPixel);
         g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
 
-        // Set text rendering hint based on font size
-        Gdiplus::REAL fontSize = font->GetSize();
-        g.SetTextRenderingHint(fontSize <= 20.0f
-            ? Gdiplus::TextRenderingHintClearTypeGridFit
-            : Gdiplus::TextRenderingHintAntiAliasGridFit);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
 
-        // Apply view scaling
-        int clientW, clientH;
-        float scale = GetViewScale(&clientW, &clientH);
-
-        // Compute offsets to center/align the viewport in the client area
         float offsetX = 0, offsetY = 0;
         float scaledViewW = (float)g_viewWidth * scale;
         float scaledViewH = (float)g_viewHeight * scale;
@@ -163,7 +201,6 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
         if (g_valign == 1) offsetY = ((float)clientH - scaledViewH) / 2.0f;
         else if (g_valign == 2) offsetY = (float)clientH - scaledViewH;
 
-        // Translate to the viewport origin in client space, then apply scale
         Gdiplus::Matrix matrix;
         matrix.Translate(offsetX, offsetY);
         matrix.Scale(scale, scale);
@@ -180,60 +217,60 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
             float fy = (float)y + (g_currentFont ? g_currentFont->yOffset : 0);
             if (g_pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
 
-            // Split into lines
             auto lines = SplitLines(wstr);
-            if (lines.empty()) return;
+            if (!lines.empty()) {
+                Gdiplus::RectF bounds;
+                g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
+                float lineH = bounds.Height + g_lineSpacing;
+                float totalH = (float)lines.size() * lineH - g_lineSpacing;
 
-            // Measure first line for line height
-            Gdiplus::RectF bounds;
-            g.MeasureString(lines[0].c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
-            float lineH = bounds.Height + g_lineSpacing;
+                float drawY = fy;
+                if (g_valign == 1) drawY = fy - totalH / 2.0f;
+                else if (g_valign == 2) drawY = fy - totalH;
 
-            // Total text block height for vertical alignment
-            float totalH = (float)lines.size() * lineH - g_lineSpacing;
+                bool doStroke = g_currentFont && g_currentFont->stroke;
 
-            // Apply alignment for the whole block
-            float drawY = fy;
-            if (g_valign == 1) drawY = fy - totalH / 2.0f;
-            else if (g_valign == 2) drawY = fy - totalH;
+                for (size_t i = 0; i < lines.size(); i++) {
+                    float lineX = fx;
+                    float lineY = drawY + (float)i * lineH;
 
-            bool doStroke = g_currentFont && g_currentFont->stroke;
+                    if (g_halign != 0) {
+                        Gdiplus::RectF lineBounds;
+                        g.MeasureString(lines[i].c_str(), -1, font,
+                            Gdiplus::PointF(0, 0), &lineBounds);
+                        if (g_halign == 1) lineX = fx - lineBounds.Width / 2.0f;
+                        else if (g_halign == 2) lineX = fx - lineBounds.Width;
+                    }
 
-            for (size_t i = 0; i < lines.size(); i++) {
-                float lineX = fx;
-                float lineY = drawY + (float)i * lineH;
+                    if (g_pixelAlign) { lineX = floorf(lineX); lineY = floorf(lineY); }
 
-                // Horizontal alignment per line
-                if (g_halign != 0) {
-                    Gdiplus::RectF lineBounds;
-                    g.MeasureString(lines[i].c_str(), -1, font,
-                        Gdiplus::PointF(0, 0), &lineBounds);
-                    if (g_halign == 1) lineX = fx - lineBounds.Width / 2.0f;
-                    else if (g_halign == 2) lineX = fx - lineBounds.Width;
-                }
-
-                if (g_pixelAlign) { lineX = floorf(lineX); lineY = floorf(lineY); }
-
-                if (doStroke) {
-                    Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-                    for (int ox = -1; ox <= 1; ox++) {
-                        for (int oy = -1; oy <= 1; oy++) {
-                            if (ox == 0 && oy == 0) continue;
-                            g.DrawString(lines[i].c_str(), -1, font,
-                                Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
-                                &strokeBrush);
+                    if (doStroke) {
+                        Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+                        for (int ox = -1; ox <= 1; ox++) {
+                            for (int oy = -1; oy <= 1; oy++) {
+                                if (ox == 0 && oy == 0) continue;
+                                g.DrawString(lines[i].c_str(), -1, font,
+                                    Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
+                                    &strokeBrush);
+                            }
                         }
                     }
-                }
 
-                Gdiplus::SolidBrush textBrush(textColor);
-                g.DrawString(lines[i].c_str(), -1, font,
-                    Gdiplus::PointF(lineX, lineY), &textBrush);
+                    Gdiplus::SolidBrush textBrush(textColor);
+                    g.DrawString(lines[i].c_str(), -1, font,
+                        Gdiplus::PointF(lineX, lineY), &textBrush);
+                }
             }
         }
     }
 
-    ReleaseDC(g_gameWindow, hdc);
+    BLENDFUNCTION blend = {0};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    AlphaBlend(winDC, 0, 0, clientW, clientH, g_memDC, 0, 0, clientW, clientH, blend);
+
+    ReleaseDC(g_gameWindow, winDC);
 }
 
 static Gdiplus::Font* GetGdiFont()
@@ -268,6 +305,10 @@ DOUBLE WINAPI FWInit(DOUBLE sprite, DOUBLE argList)
     g_valign = 0;
     g_lineSpacing = 0.0f;
     g_pixelAlign = false;
+
+    // Subclass window to suppress background erase (reduces flicker)
+    g_origWndProc = (WNDPROC)SetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)WindowSubclass);
+
     return TRUE;
 }
 
@@ -290,6 +331,18 @@ DOUBLE WINAPI FWCleanup()
     }
     g_fontMap.clear();
     g_fontCount = 0;
+
+    // Restore original wndproc
+    if (g_origWndProc && g_gameWindow) {
+        SetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)g_origWndProc);
+        g_origWndProc = NULL;
+    }
+
+    // Free double-buffer resources
+    if (g_memDib) { DeleteObject(g_memDib); g_memDib = NULL; g_memBits = NULL; }
+    if (g_memDC) { DeleteDC(g_memDC); g_memDC = NULL; }
+    g_memW = g_memH = 0;
+
     if (g_gdiplusToken) {
         Gdiplus::GdiplusShutdown(g_gdiplusToken);
         g_gdiplusToken = 0;
