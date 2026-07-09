@@ -78,63 +78,6 @@ static std::wstring AnsiToWide(LPCSTR input)
     return result;
 }
 
-static HWND g_overlayWnd = NULL;
-static WNDPROC g_origGameWndProc = NULL;
-
-static void UpdateOverlayPosition();
-
-static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    if (msg == WM_SIZE) {
-        if (wParam == SIZE_MINIMIZED) {
-            if (g_overlayWnd) ShowWindow(g_overlayWnd, SW_HIDE);
-        } else if (g_overlayWnd) {
-            ShowWindow(g_overlayWnd, SW_SHOWNA);
-            UpdateOverlayPosition();
-        }
-    }
-    if (msg == WM_WINDOWPOSCHANGED || msg == WM_MOVE || msg == WM_SIZE) {
-        UpdateOverlayPosition();
-    }
-    return CallWindowProcW(g_origGameWndProc, hwnd, msg, wParam, lParam);
-}
-
-static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
-
-static void EnsureOverlayWindow()
-{
-    if (g_overlayWnd && IsWindow(g_overlayWnd)) return;
-    if (!g_gameWindow || !IsWindow(g_gameWindow)) return;
-
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = OverlayWndProc;
-    wc.hInstance = GetModuleHandleW(NULL);
-    wc.lpszClassName = L"FWOverlay";
-    RegisterClassW(&wc);
-
-    g_overlayWnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-        L"FWOverlay", L"", WS_POPUP,
-        0, 0, 800, 600, NULL, NULL, wc.hInstance, NULL);
-    DebugLog("Overlay window created: %p", g_overlayWnd);
-}
-
-static void UpdateOverlayPosition()
-{
-    if (!g_overlayWnd || !IsWindow(g_overlayWnd)) return;
-    if (!g_gameWindow || !IsWindow(g_gameWindow)) return;
-    RECT rc;
-    GetClientRect(g_gameWindow, &rc);
-    POINT pt = { 0, 0 };
-    ClientToScreen(g_gameWindow, &pt);
-    SetWindowPos(g_overlayWnd, HWND_TOPMOST, pt.x, pt.y,
-        rc.right - rc.left, rc.bottom - rc.top,
-        SWP_NOACTIVATE | SWP_NOCOPYBITS);
-}
-
 DOUBLE WINAPI FWSetViewSize(DOUBLE w, DOUBLE h)
 {
     g_viewWidth = (int)w;
@@ -152,12 +95,7 @@ DOUBLE WINAPI FWInit(DOUBLE sprite, DOUBLE argList)
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &g_gdiplusStartupInput, NULL);
     DebugLog("GDI+ started: token=0x%lx", g_gdiplusToken);
     g_gameWindow = FindGameWindow();
-    DebugLog("Found game window: %p (class=%s)", g_gameWindow, g_gameWindow ? "?" : "null");
-    if (g_gameWindow) {
-        g_origGameWndProc = (WNDPROC)SetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)GameWndProc);
-        DebugLog("Subclassed game window: origProc=%p", g_origGameWndProc);
-    }
-    EnsureOverlayWindow();
+    DebugLog("Found game window: %p", g_gameWindow);
     g_fontCount = 0;
     g_currentFont = NULL;
     g_halign = 0;
@@ -174,11 +112,6 @@ DOUBLE WINAPI FWReleaseCache()
 
 DOUBLE WINAPI FWCleanup()
 {
-    if (g_origGameWndProc && g_gameWindow && IsWindow(g_gameWindow)) {
-        SetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC, (LONG_PTR)g_origGameWndProc);
-        DebugLog("Restored original game WndProc");
-        g_origGameWndProc = NULL;
-    }
     g_currentFont = NULL;
     for (auto& pair : g_fontMap) {
         FontInfo* fi = pair.second;
@@ -427,12 +360,12 @@ DOUBLE WINAPI FWStringHeightEx(LPCSTR str, DOUBLE sep, DOUBLE w)
     return FWStringHeight(str);
 }
 
-// Draw text using GDI+ to a transparent overlay window on top of the game window
-// This avoids D3D overwriting GDI content
+// Draw text directly to the game window's HDC using GDI+.
+// The text is drawn on top of the D3D content each frame.
 static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
 {
     Gdiplus::Font* font = GetGdiFont();
-    if (!font) { DebugLog("DrawGdiText: no font"); return; }
+    if (!font) return;
 
     bool empty = (!str || !*str);
     std::wstring wstr;
@@ -446,116 +379,59 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
     }
     if (!g_gameWindow || !IsWindow(g_gameWindow)) return;
 
-    EnsureOverlayWindow();
-    if (!g_overlayWnd || !IsWindow(g_overlayWnd)) return;
+    HDC hdc = GetDC(g_gameWindow);
+    if (!hdc) return;
 
-    UpdateOverlayPosition();
+    // Draw on game window DC — text persists on screen until next D3D Present
+    {
+        Gdiplus::Graphics g(hdc);
+        g.SetPageUnit(Gdiplus::UnitPixel);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        Gdiplus::REAL fontSize = font->GetSize();
+        g.SetTextRenderingHint(fontSize <= 20.0f
+            ? Gdiplus::TextRenderingHintClearTypeGridFit
+            : Gdiplus::TextRenderingHintAntiAliasGridFit);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
 
-    RECT rc;
-    GetClientRect(g_gameWindow, &rc);
-    if (rc.right <= 0 || rc.bottom <= 0) return;
+        if (!empty) {
+            BYTE a = (BYTE)(alpha * 255.0f);
+            BYTE r = (color >> 16) & 0xFF;
+            BYTE gr = (color >> 8) & 0xFF;
+            BYTE b = color & 0xFF;
 
-    int w = rc.right, h = rc.bottom;
-    POINT screenPt = {0, 0};
-    ClientToScreen(g_gameWindow, &screenPt);
+            float fx = (float)x + (g_currentFont ? g_currentFont->xOffset : 0);
+            float fy = (float)y + (g_currentFont ? g_currentFont->yOffset : 0);
+            if (g_pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
 
-    HDC screenDC = GetDC(NULL);
-    if (!screenDC) return;
+            Gdiplus::RectF bounds;
+            g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
 
-    // Create 32-bit ARGB DIBSection for per-pixel alpha
-    BITMAPV5HEADER bi = {};
-    bi.bV5Size = sizeof(BITMAPV5HEADER);
-    bi.bV5Width = w;
-    bi.bV5Height = -h; // top-down
-    bi.bV5Planes = 1;
-    bi.bV5BitCount = 32;
-    bi.bV5Compression = BI_RGB;
-    bi.bV5AlphaMask = 0xFF000000;
+            Gdiplus::PointF pt(fx, fy);
+            if (g_valign == 1) pt.Y = fy - bounds.Height / 2.0f;
+            else if (g_valign == 2) pt.Y = fy - bounds.Height;
+            if (g_halign == 1) pt.X = fx - bounds.Width / 2.0f;
+            else if (g_halign == 2) pt.X = fx - bounds.Width;
 
-    void* bits = NULL;
-    HBITMAP dib = CreateDIBSection(screenDC, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!dib) { ReleaseDC(NULL, screenDC); return; }
-
-    HDC memdc = CreateCompatibleDC(screenDC);
-    HBITMAP oldbmp = (HBITMAP)SelectObject(memdc, dib);
-
-    // Wrap DIB with Gdiplus::Bitmap for alpha-aware drawing
-    Gdiplus::Bitmap gdiBmp(w, h, 4 * w, PixelFormat32bppARGB, (BYTE*)bits);
-    Gdiplus::Graphics g(&gdiBmp);
-    g.SetPageUnit(Gdiplus::UnitPixel);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-    // Match original FoxWriting: ClearType for small fonts, anti-alias for large
-    Gdiplus::REAL fontSize = font->GetSize();
-    g.SetTextRenderingHint(fontSize <= 20.0f
-        ? Gdiplus::TextRenderingHintClearTypeGridFit
-        : Gdiplus::TextRenderingHintAntiAliasGridFit);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-
-    // Clear to transparent
-    g.Clear(Gdiplus::Color(0, 0, 0, 0));
-
-    if (!empty) {
-        BYTE a = (BYTE)(alpha * 255.0f);
-        BYTE r = (color >> 16) & 0xFF;
-        BYTE gr = (color >> 8) & 0xFF;
-        BYTE b = color & 0xFF;
-
-        // Scale coordinates from game view to window client (for window maximize etc.)
-        float scaleX = (float)w / (float)g_viewWidth;
-        float scaleY = (float)h / (float)g_viewHeight;
-        g.ScaleTransform(scaleX, scaleY, Gdiplus::MatrixOrderAppend);
-
-        float fx = (float)x + (g_currentFont ? g_currentFont->xOffset : 0);
-        float fy = (float)y + (g_currentFont ? g_currentFont->yOffset : 0);
-        if (g_pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
-
-        Gdiplus::RectF bounds;
-        g.MeasureString(wstr.c_str(), -1, font, Gdiplus::PointF(0, 0), &bounds);
-
-        Gdiplus::PointF pt(fx, fy);
-        if (g_valign == 1) pt.Y = fy - bounds.Height / 2.0f;
-        else if (g_valign == 2) pt.Y = fy - bounds.Height;
-        if (g_halign == 1) pt.X = fx - bounds.Width / 2.0f;
-        else if (g_halign == 2) pt.X = fx - bounds.Width;
-
-        // Draw outline (stroke) if enabled: 8-dir offset in fully opaque black
-        // Scale the 1px offset by inverse scale so stroke stays 1px in screen space
-        float invScaleX = 1.0f / scaleX;
-        float invScaleY = 1.0f / scaleY;
-        bool doStroke = g_currentFont && g_currentFont->stroke;
-        if (doStroke) {
-            Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-            for (int ox = -1; ox <= 1; ox++) {
-                for (int oy = -1; oy <= 1; oy++) {
-                    if (ox == 0 && oy == 0) continue;
-                    g.DrawString(wstr.c_str(), -1, font,
-                        Gdiplus::PointF(pt.X + (float)ox * invScaleX, pt.Y + (float)oy * invScaleY),
-                        &strokeBrush);
+            // Stroke: 8-dir offset black outline
+            bool doStroke = g_currentFont && g_currentFont->stroke;
+            if (doStroke) {
+                Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+                for (int ox = -1; ox <= 1; ox++) {
+                    for (int oy = -1; oy <= 1; oy++) {
+                        if (ox == 0 && oy == 0) continue;
+                        g.DrawString(wstr.c_str(), -1, font,
+                            Gdiplus::PointF(pt.X + (float)ox, pt.Y + (float)oy),
+                            &strokeBrush);
+                    }
                 }
             }
-        }
 
-        // Draw main text
-        Gdiplus::SolidBrush textBrush(Gdiplus::Color(a, r, gr, b));
-        g.DrawString(wstr.c_str(), -1, font, pt, &textBrush);
+            Gdiplus::SolidBrush textBrush(Gdiplus::Color(a, r, gr, b));
+            g.DrawString(wstr.c_str(), -1, font, pt, &textBrush);
+        }
     }
 
-    // Update layered window with per-pixel alpha
-    SIZE winSize = {w, h};
-    POINT zero = {0, 0};
-    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(g_overlayWnd, screenDC, &screenPt, &winSize, memdc, &zero, 0, &blend, ULW_ALPHA);
-
-    // Show the overlay window on first use
-    ShowWindow(g_overlayWnd, SW_SHOWNA);
-
-    SelectObject(memdc, oldbmp);
-    DeleteObject(dib);
-    DeleteDC(memdc);
-    ReleaseDC(NULL, screenDC);
-
-    DebugLog("DrawGdiText: updated overlay at (%d,%d) size=%dx%d stroke=%d",
-        screenPt.x, screenPt.y, w, h, g_currentFont ? g_currentFont->stroke : 0);
+    ReleaseDC(g_gameWindow, hdc);
 }
 
 DOUBLE WINAPI FWDrawText(DOUBLE x, DOUBLE y, LPCSTR str)
