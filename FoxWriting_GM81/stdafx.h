@@ -9,8 +9,8 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm>
+#define _USE_MATH_DEFINES
 #include <cmath>
 
-#define _USE_MATH_DEFINES
 #include <GdiPlus.h>
 #pragma comment(lib, "Gdiplus")

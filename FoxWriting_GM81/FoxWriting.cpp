@@ -1,10 +1,11 @@
 #include "stdafx.h"
 #include "FoxWriting.h"
 #include "CodePage.h"
+#include "d3d9_mini.h"
 
 #include <fstream>
 #include <sstream>
-#include <d3d9.h>
+#include <cstring>
 
 static void DebugLog(const char* fmt, ...)
 {
@@ -131,56 +132,169 @@ static std::vector<TextDrawItem> g_textQueue;
 // Reads the D3D9 device pointer from the gm82dx9 extension's
 // storage location (fixed address 0x6886a8, no ASLR in gm82vp.exe),
 // then hooks IDirect3DDevice9::Present[vtable 17] to render text
-// via GetBackBuffer → GetDC → GDI+ right before Present submits.
+// via GetBackBuffer → GDI+ Bitmap → D3D9 texture quad right before
+// Present submits.
 
 static IDirect3DDevice9* g_d3d9Device = NULL;
 
 typedef HRESULT (__stdcall *Present9_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 static Present9_t g_realPresent9 = NULL;
 
-// Two-surface pipeline for GDI+ text rendering: sysmem surface (GetDC) →
-// default-pool surface (StretchRect) → backbuffer.
-static IDirect3DSurface9* g_textSurfaceSys = NULL; // D3DPOOL_SYSTEMMEM
-static IDirect3DSurface9* g_textSurfaceDef = NULL; // D3DPOOL_DEFAULT
-static int g_textSurfaceW = 0;
-static int g_textSurfaceH = 0;
-static D3DFORMAT g_textSurfaceFmt = D3DFMT_UNKNOWN;
+// GDI+ Bitmap -> D3D9 texture pipeline. Text is rasterized by GDI+ into an
+// in-memory ARGB bitmap, uploaded to a D3D9 texture, then drawn as a
+// full-screen textured quad in the Present hook. This stays entirely inside
+// the D3D pipeline and avoids GetDC / GetRenderTargetData / StretchRect on
+// D3D surfaces -- calls that fail or produce no output on some GPU drivers
+// (e.g. Intel integrated graphics under Windows 11 24H2).
+static IDirect3DTexture9* g_textTexture = NULL; // D3DPOOL_DEFAULT, A8R8G8B8
+static IDirect3DVertexDeclaration9* g_quadDecl = NULL; // XYZRHW + TEX1
+static int g_textTexW = 0;
+static int g_textTexH = 0;
 
 #define SAFE_RELEASE(p) do { if (p) { (p)->Release(); (p) = NULL; } } while(0)
 
-static bool EnsureTextSurfaces(IDirect3DDevice9* device, int backW, int backH, D3DFORMAT backFmt)
+static bool EnsureTextTexture(IDirect3DDevice9* device, int w, int h)
 {
-    if (g_textSurfaceSys && g_textSurfaceW == backW && g_textSurfaceH == backH)
+    if (g_textTexture && g_textTexW == w && g_textTexH == h)
         return true;
 
-    SAFE_RELEASE(g_textSurfaceSys);
-    SAFE_RELEASE(g_textSurfaceDef);
+    SAFE_RELEASE(g_textTexture);
 
-    HRESULT hr = device->CreateOffscreenPlainSurface(backW, backH, backFmt, D3DPOOL_SYSTEMMEM, &g_textSurfaceSys, NULL);
+    // D3DUSAGE_DYNAMIC so we can LockRect(DISCARD) each frame for updates.
+    HRESULT hr = device->CreateTexture(w, h, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT, &g_textTexture, NULL);
     if (FAILED(hr)) {
-        DebugLog("EnsureTextSurfaces: SYSMEM %dx%d fmt=%d failed hr=%08X", backW, backH, backFmt, hr);
+        DebugLog("EnsureTextTexture: %dx%d failed hr=%08X", w, h, hr);
         return false;
     }
 
-    hr = device->CreateOffscreenPlainSurface(backW, backH, backFmt, D3DPOOL_DEFAULT, &g_textSurfaceDef, NULL);
-    if (FAILED(hr)) {
-        DebugLog("EnsureTextSurfaces: DEFAULT %dx%d fmt=%d failed hr=%08X", backW, backH, backFmt, hr);
-        SAFE_RELEASE(g_textSurfaceSys);
-        return false;
+    g_textTexW = w;
+    g_textTexH = h;
+
+    if (!g_quadDecl) {
+        D3DVERTEXELEMENT9 elts[] = {
+            { 0, 0,  D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITIONT, 0 },
+            { 0, 16, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD,  0 },
+            D3DDECL_END()
+        };
+        if (FAILED(device->CreateVertexDeclaration(elts, &g_quadDecl)))
+            DebugLog("EnsureTextTexture: CreateVertexDeclaration failed");
     }
 
-    g_textSurfaceW = backW;
-    g_textSurfaceH = backH;
-    g_textSurfaceFmt = backFmt;
-    DebugLog("EnsureTextSurfaces: %dx%d fmt=%d sys=%p def=%p", backW, backH, backFmt, g_textSurfaceSys, g_textSurfaceDef);
+    DebugLog("EnsureTextTexture: %dx%d tex=%p", w, h, g_textTexture);
     return true;
 }
 
-// Draw queued text items on any HDC (called from Present hook).
-// Separate function avoids C2712 (__try with C++ dtors).
-static void RenderQueueOnDC(HDC hdc)
+// Draw the text texture as a full-screen alpha-blended quad over the
+// backbuffer. All touched device state is saved and restored afterwards.
+static void DrawTextQuad(IDirect3DDevice9* device, IDirect3DSurface9* backbuf, int w, int h)
 {
-    Gdiplus::Graphics g(hdc);
+    struct TV { float x, y, z, rhw, u, v; };
+    TV v[4] = {
+        { 0,        0,        0, 1, 0, 0 },
+        { (float)w, 0,        0, 1, 1, 0 },
+        { 0,        (float)h, 0, 1, 0, 1 },
+        { (float)w, (float)h, 0, 1, 1, 1 },
+    };
+
+    DWORD sZEnable, sZWrite, sABlend, sSrc, sDst, sCull, sLight, sFog, sATest, sScissor;
+    device->GetRenderState(D3DRS_ZENABLE, &sZEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &sZWrite);
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &sABlend);
+    device->GetRenderState(D3DRS_SRCBLEND, &sSrc);
+    device->GetRenderState(D3DRS_DESTBLEND, &sDst);
+    device->GetRenderState(D3DRS_CULLMODE, &sCull);
+    device->GetRenderState(D3DRS_LIGHTING, &sLight);
+    device->GetRenderState(D3DRS_FOGENABLE, &sFog);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &sATest);
+    device->GetRenderState(D3DRS_SCISSORTESTENABLE, &sScissor);
+
+    DWORD sColorOp, sColorA1, sColorA2, sAlphaOp, sAlphaA1, sAlphaA2;
+    device->GetTextureStageState(0, D3DTSS_COLOROP, &sColorOp);
+    device->GetTextureStageState(0, D3DTSS_COLORARG1, &sColorA1);
+    device->GetTextureStageState(0, D3DTSS_COLORARG2, &sColorA2);
+    device->GetTextureStageState(0, D3DTSS_ALPHAOP, &sAlphaOp);
+    device->GetTextureStageState(0, D3DTSS_ALPHAARG1, &sAlphaA1);
+    device->GetTextureStageState(0, D3DTSS_ALPHAARG2, &sAlphaA2);
+
+    DWORD sMag, sMin, sAddrU, sAddrV;
+    device->GetSamplerState(0, D3DSAMP_MAGFILTER, &sMag);
+    device->GetSamplerState(0, D3DSAMP_MINFILTER, &sMin);
+    device->GetSamplerState(0, D3DSAMP_ADDRESSU, &sAddrU);
+    device->GetSamplerState(0, D3DSAMP_ADDRESSV, &sAddrV);
+
+    IDirect3DBaseTexture9* sTex = NULL;
+    device->GetTexture(0, &sTex);
+    IDirect3DVertexDeclaration9* sDecl = NULL;
+    device->GetVertexDeclaration(&sDecl);
+    IDirect3DSurface9* sRT = NULL;
+    device->GetRenderTarget(0, &sRT);
+
+    device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    // GDI+ 32bppARGB is premultiplied alpha -> use ONE / INVSRCALPHA.
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
+
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    device->SetTexture(0, (IDirect3DBaseTexture9*)g_textTexture);
+    device->SetRenderTarget(0, backbuf);
+    device->SetVertexDeclaration(g_quadDecl);
+    device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(TV));
+
+    // Restore previous state.
+    device->SetRenderTarget(0, sRT);
+    if (sRT) sRT->Release();
+    device->SetTexture(0, sTex);
+    if (sTex) sTex->Release();
+    device->SetVertexDeclaration(sDecl);
+    if (sDecl) sDecl->Release();
+
+    device->SetTextureStageState(0, D3DTSS_COLOROP, sColorOp);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, sColorA1);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, sColorA2);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, sAlphaOp);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, sAlphaA1);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, sAlphaA2);
+
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, sMag);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, sMin);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, sAddrU);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, sAddrV);
+
+    device->SetRenderState(D3DRS_ZENABLE, sZEnable);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, sZWrite);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, sABlend);
+    device->SetRenderState(D3DRS_SRCBLEND, sSrc);
+    device->SetRenderState(D3DRS_DESTBLEND, sDst);
+    device->SetRenderState(D3DRS_CULLMODE, sCull);
+    device->SetRenderState(D3DRS_LIGHTING, sLight);
+    device->SetRenderState(D3DRS_FOGENABLE, sFog);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, sATest);
+    device->SetRenderState(D3DRS_SCISSORTESTENABLE, sScissor);
+}
+
+// Draw queued text items onto a Gdiplus::Graphics target (either an HDC or
+// an in-memory Bitmap). Separate function avoids C2712 (__try with C++ dtors).
+static void RenderQueueOnGraphics(Gdiplus::Graphics& g)
+{
     g.SetPageUnit(Gdiplus::UnitPixel);
     g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
     g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
@@ -251,36 +365,59 @@ static void RenderQueueOnDC(HDC hdc)
     }
 }
 
-// Present hook — draws text on backbuffer, then calls original.
-// Pipeline: backbuffer → GetRenderTargetData → sysmem surface GDI+ draw
-// → UpdateSurface → default surface → StretchRect → backbuffer
-// This preserves the game's rendered content under the text overlay.
+// Thin wrapper for the legacy window-DC fallback (FWPaint).
+static void RenderQueueOnDC(HDC hdc)
+{
+    Gdiplus::Graphics g(hdc);
+    RenderQueueOnGraphics(g);
+}
+
+// Separate function to avoid C2712 (__try with C++ dtors in same function).
+static void RenderTextToBackbuffer(IDirect3DDevice9* self)
+{
+    IDirect3DSurface9* backbuf = NULL;
+    if (SUCCEEDED(self->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuf)) && backbuf) {
+        D3DSURFACE_DESC desc;
+        backbuf->GetDesc(&desc);
+        int w = (int)desc.Width;
+        int h = (int)desc.Height;
+
+        if (w > 0 && h > 0 && EnsureTextTexture(self, w, h)) {
+            Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
+            {
+                Gdiplus::Graphics g(&bmp);
+                g.Clear(Gdiplus::Color(0, 0, 0, 0));
+                RenderQueueOnGraphics(g);
+            }
+
+            Gdiplus::BitmapData bd;
+            Gdiplus::Rect rect(0, 0, w, h);
+            if (bmp.LockBits(&rect, Gdiplus::ImageLockModeRead,
+                    PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+                D3DLOCKED_RECT lr;
+                if (SUCCEEDED(g_textTexture->LockRect(0, &lr, NULL, D3DLOCK_DISCARD))) {
+                    BYTE* src = (BYTE*)bd.Scan0;
+                    BYTE* dst = (BYTE*)lr.pBits;
+                    SIZE_T rowBytes = (SIZE_T)w * 4;
+                    for (int y = 0; y < h; y++)
+                        memcpy(dst + (SIZE_T)y * lr.Pitch,
+                               src + (SIZE_T)y * bd.Stride, rowBytes);
+                    g_textTexture->UnlockRect(0);
+                    DrawTextQuad(self, backbuf, w, h);
+                }
+                bmp.UnlockBits(&bd);
+            }
+        }
+        backbuf->Release();
+    }
+}
+
+// Present hook — calls RenderTextToBackbuffer inside SEH, then original Present.
 static HRESULT __stdcall Present9Hook(IDirect3DDevice9* self, const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion)
 {
     if (!g_textQueue.empty() && self && (!g_gameWindow || !IsIconic(g_gameWindow))) {
         __try {
-            IDirect3DSurface9* backbuf = NULL;
-            if (SUCCEEDED(self->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuf)) && backbuf) {
-                D3DSURFACE_DESC desc;
-                backbuf->GetDesc(&desc);
-
-                if (EnsureTextSurfaces(self, desc.Width, desc.Height, desc.Format)) {
-                    // Copy game content from backbuffer (DEFAULT) → sysmem surface
-                    if (SUCCEEDED(self->GetRenderTargetData(backbuf, g_textSurfaceSys))) {
-                        HDC hdc = NULL;
-                        if (SUCCEEDED(g_textSurfaceSys->GetDC(&hdc)) && hdc) {
-                            RenderQueueOnDC(hdc);
-                            g_textSurfaceSys->ReleaseDC(hdc);
-
-                            // Copy back: sysmem → DEFAULT → backbuffer
-                            RECT rc = {0, 0, (LONG)desc.Width, (LONG)desc.Height};
-                            self->UpdateSurface(g_textSurfaceSys, &rc, g_textSurfaceDef, NULL);
-                            self->StretchRect(g_textSurfaceDef, &rc, backbuf, &rc, D3DTEXF_POINT);
-                        }
-                    }
-                }
-                backbuf->Release();
-            }
+            RenderTextToBackbuffer(self);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             DebugLog("Present9Hook: exception");
         }
@@ -305,19 +442,20 @@ static bool HookPresentVtable(IDirect3DDevice9* device)
     return true;
 }
 
-// Verify a potential D3D9 device by checking its vtable belongs to d3d9.dll.
+// Verify a D3D9 device by trying AddRef/Release — the only 100% reliable test.
 static bool IsValidD3D9Device(IDirect3DDevice9* device)
 {
     if (!device) return false;
-    HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
-    if (!hD3D9) return false;
 
-    DWORD_PTR* vtbl = *(DWORD_PTR**)device;
-    if (!vtbl) return false;
-
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery((void*)vtbl[0], &mbi, sizeof(mbi))) return false;
-    return (mbi.AllocationBase == (void*)hD3D9);
+    __try {
+        ULONG ref = device->AddRef();
+        device->Release();
+        DebugLog("IsValidD3D9Device: device=%p AddRef=%u OK", device, ref);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DebugLog("IsValidD3D9Device: device=%p crashed — rejecting", device);
+        return false;
+    }
 }
 
 // Try to find an already-existing D3D9 device (created by the gm82dx9
@@ -385,8 +523,8 @@ DOUBLE WINAPI FWReleaseCache()
 DOUBLE WINAPI FWCleanup()
 {
     g_textQueue.clear();
-    SAFE_RELEASE(g_textSurfaceSys);
-    SAFE_RELEASE(g_textSurfaceDef);
+    SAFE_RELEASE(g_textTexture);
+    SAFE_RELEASE(g_quadDecl);
     g_currentFont = NULL;
     for (auto& pair : g_fontMap) {
         FontInfo* fi = pair.second;
@@ -681,7 +819,7 @@ DOUBLE WINAPI FWStringHeightEx(LPCSTR str, DOUBLE sep, DOUBLE w)
     return bounds.Height;
 }
 
-// Queue text items for D3D Present hook to render
+// Queue text items for D3D Present hook, or render directly if no D3D9 device.
 static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
 {
     Gdiplus::Font* font = GetGdiFont();
@@ -704,26 +842,55 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
         TryFindD3D9Device();
     }
 
-    TextDrawItem item;
-    item.text = wstr;
-    item.x = (float)x;
-    item.y = (float)y;
-    item.color = color;
-    item.alpha = (float)alpha;
-    item.font = font;
-    item.halign = g_halign;
-    item.valign = g_valign;
-    item.xOffset = g_currentFont ? g_currentFont->xOffset : 0;
-    item.yOffset = g_currentFont ? g_currentFont->yOffset : 0;
-    item.lineSpacing = g_lineSpacing;
-    item.pixelAlign = g_pixelAlign;
-    item.doStroke = g_currentFont ? g_currentFont->stroke : false;
-    g_textQueue.push_back(item);
+    // If D3D9 is available, queue for Present-hook render (no-flicker).
+    // Otherwise fall back to direct GDI+ window DC render (may flicker).
+    if (g_d3d9Device) {
+        TextDrawItem item;
+        item.text = wstr;
+        item.x = (float)x;
+        item.y = (float)y;
+        item.color = color;
+        item.alpha = (float)alpha;
+        item.font = font;
+        item.halign = g_halign;
+        item.valign = g_valign;
+        item.xOffset = g_currentFont ? g_currentFont->xOffset : 0;
+        item.yOffset = g_currentFont ? g_currentFont->yOffset : 0;
+        item.lineSpacing = g_lineSpacing;
+        item.pixelAlign = g_pixelAlign;
+        item.doStroke = g_currentFont ? g_currentFont->stroke : false;
+        g_textQueue.push_back(item);
+    } else if (!IsIconic(g_gameWindow)) {
+        // Instant fallback: draw directly to game window DC
+        HDC hdc = GetDC(g_gameWindow);
+        if (hdc) {
+            // Build a temporary queue with just this item
+            TextDrawItem tmp;
+            tmp.text = wstr;
+            tmp.x = (float)x;
+            tmp.y = (float)y;
+            tmp.color = color;
+            tmp.alpha = (float)alpha;
+            tmp.font = font;
+            tmp.halign = g_halign;
+            tmp.valign = g_valign;
+            tmp.xOffset = g_currentFont ? g_currentFont->xOffset : 0;
+            tmp.yOffset = g_currentFont ? g_currentFont->yOffset : 0;
+            tmp.lineSpacing = g_lineSpacing;
+            tmp.pixelAlign = g_pixelAlign;
+            tmp.doStroke = g_currentFont ? g_currentFont->stroke : false;
+            g_textQueue.push_back(tmp);
+            RenderQueueOnDC(hdc);
+            g_textQueue.clear();
+            ReleaseDC(g_gameWindow, hdc);
+        }
+    }
 }
 
 DOUBLE WINAPI FWDrawText(DOUBLE x, DOUBLE y, LPCSTR str)
 {
-    DebugLog("FWDrawText(%f, %f, '%s')", x, y, str ? str : "null");
+    if (str && *str)
+        DebugLog("FWDrawText(%f, %f, '%s')", x, y, str);
     DrawGdiText((int)x, (int)y, str, g_drawColor1, g_drawAlpha);
     return TRUE;
 }
