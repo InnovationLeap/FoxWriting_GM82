@@ -37,6 +37,10 @@ double g_drawAlpha = 1.0;
 static UINT g_codePage = CP_ACP;
 static int g_viewWidth = 800;
 static int g_viewHeight = 600;
+static float g_screenDpiX = 96.0f;
+static float g_screenDpiY = 96.0f;
+
+static const int RENDER_SCALE = 4;
 
 static HWND FindGameWindow()
 {
@@ -250,7 +254,7 @@ static void DrawTextQuad(IDirect3DDevice9* device, IDirect3DSurface9* backbuf, i
     device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
 
     device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
     device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
@@ -293,11 +297,12 @@ static void DrawTextQuad(IDirect3DDevice9* device, IDirect3DSurface9* backbuf, i
 
 // Draw queued text items onto a Gdiplus::Graphics target (either an HDC or
 // an in-memory Bitmap). Separate function avoids C2712 (__try with C++ dtors).
-static void RenderQueueOnGraphics(Gdiplus::Graphics& g)
+static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
 {
     g.SetPageUnit(Gdiplus::UnitPixel);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighSpeed);
+    g.SetTextContrast(4);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeNone);
 
     Gdiplus::StringFormat typoFmt(Gdiplus::StringFormat::GenericTypographic());
     typoFmt.SetAlignment(Gdiplus::StringAlignmentNear);
@@ -315,9 +320,11 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g)
         BYTE b = item.color & 0xFF;
         Gdiplus::Color textColor(a, r, gr, b);
 
-        float fx = item.x + item.xOffset;
-        float fy = item.y + item.yOffset;
+        float fx = (item.x + item.xOffset) * pageScale;
+        float fy = (item.y + item.yOffset) * pageScale;
         if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
+
+        float scaledSpacing = item.lineSpacing * pageScale;
 
         auto lines = SplitLines(item.text);
         if (lines.empty()) continue;
@@ -325,8 +332,8 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g)
         Gdiplus::RectF bounds;
         g.MeasureString(lines[0].c_str(), -1, item.font,
             Gdiplus::PointF(0, 0), &typoFmt, &bounds);
-        float lineH = bounds.Height + item.lineSpacing;
-        float totalH = (float)lines.size() * lineH - item.lineSpacing;
+        float lineH = bounds.Height + scaledSpacing;
+        float totalH = (float)lines.size() * lineH - scaledSpacing;
 
         float drawY = fy;
         if (item.valign == 1) drawY = fy - totalH / 2.0f;
@@ -352,7 +359,7 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g)
                     for (int oy = -1; oy <= 1; oy++) {
                         if (ox == 0 && oy == 0) continue;
                         g.DrawString(lines[li].c_str(), -1, item.font,
-                            Gdiplus::PointF(lineX + (float)ox, lineY + (float)oy),
+                            Gdiplus::PointF(lineX + (float)ox * pageScale, lineY + (float)oy * pageScale),
                             &typoFmt, &strokeBrush);
                     }
                 }
@@ -382,24 +389,27 @@ static void RenderTextToBackbuffer(IDirect3DDevice9* self)
         int w = (int)desc.Width;
         int h = (int)desc.Height;
 
-        if (w > 0 && h > 0 && EnsureTextTexture(self, w, h)) {
-            Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
+        int tw = w * RENDER_SCALE;
+        int th = h * RENDER_SCALE;
+        if (w > 0 && h > 0 && EnsureTextTexture(self, tw, th)) {
+            Gdiplus::Bitmap bmp(tw, th, PixelFormat32bppARGB);
+            bmp.SetResolution(g_screenDpiX * RENDER_SCALE, g_screenDpiY * RENDER_SCALE);
             {
                 Gdiplus::Graphics g(&bmp);
                 g.Clear(Gdiplus::Color(0, 0, 0, 0));
-                RenderQueueOnGraphics(g);
+                RenderQueueOnGraphics(g, (float)RENDER_SCALE);
             }
 
             Gdiplus::BitmapData bd;
-            Gdiplus::Rect rect(0, 0, w, h);
+            Gdiplus::Rect rect(0, 0, tw, th);
             if (bmp.LockBits(&rect, Gdiplus::ImageLockModeRead,
                     PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
                 D3DLOCKED_RECT lr;
                 if (SUCCEEDED(g_textTexture->LockRect(0, &lr, NULL, D3DLOCK_DISCARD))) {
                     BYTE* src = (BYTE*)bd.Scan0;
                     BYTE* dst = (BYTE*)lr.pBits;
-                    SIZE_T rowBytes = (SIZE_T)w * 4;
-                    for (int y = 0; y < h; y++)
+                    SIZE_T rowBytes = (SIZE_T)tw * 4;
+                    for (int y = 0; y < th; y++)
                         memcpy(dst + (SIZE_T)y * lr.Pitch,
                                src + (SIZE_T)y * bd.Stride, rowBytes);
                     g_textTexture->UnlockRect(0);
@@ -502,6 +512,13 @@ DOUBLE WINAPI FWInit(DOUBLE sprite, DOUBLE argList)
 {
     DebugLog("===== FWInit(%f, %f) =====", sprite, argList);
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &g_gdiplusStartupInput, NULL);
+    {
+        HDC hdc = GetDC(NULL);
+        g_screenDpiX = (float)GetDeviceCaps(hdc, LOGPIXELSX);
+        g_screenDpiY = (float)GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(NULL, hdc);
+        DebugLog("Screen DPI: %.0f x %.0f", g_screenDpiX, g_screenDpiY);
+    }
     g_gameWindow = FindGameWindow();
     DebugLog("Found game window: %p", g_gameWindow);
     g_fontCount = 0;

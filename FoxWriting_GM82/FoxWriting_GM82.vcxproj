@@ -9,7 +9,7 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{B3C8A7D1-2E4F-4A9B-8C6D-5F1E3A2B4C0D}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
-    <RootNamespace>FoxWriting_GM81</RootNamespace>
+    <RootNamespace>FoxWriting_GM82</RootNamespace>
     <TargetPlatformVersion>10.0</TargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -30,7 +30,7 @@
     <LinkIncremental>false</LinkIncremental>
     <OutDir>$(ProjectDir)..\</OutDir>
     <IntDir>$(ProjectDir)Release\</IntDir>
-    <TargetName>FoxWriting</TargetName>
+    <TargetName>FoxWriting_GM82</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
