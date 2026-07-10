@@ -40,7 +40,7 @@ static int g_viewHeight = 600;
 static float g_screenDpiX = 96.0f;
 static float g_screenDpiY = 96.0f;
 
-static const int RENDER_SCALE = 4;
+static const int RENDER_SCALE = 2;
 
 static HWND FindGameWindow()
 {
@@ -906,8 +906,6 @@ static void DrawGdiText(int x, int y, LPCSTR str, int color, double alpha)
 
 DOUBLE WINAPI FWDrawText(DOUBLE x, DOUBLE y, LPCSTR str)
 {
-    if (str && *str)
-        DebugLog("FWDrawText(%f, %f, '%s')", x, y, str);
     DrawGdiText((int)x, (int)y, str, g_drawColor1, g_drawAlpha);
     return TRUE;
 }
