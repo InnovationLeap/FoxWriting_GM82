@@ -40,7 +40,7 @@ static int g_viewHeight = 600;
 static float g_screenDpiX = 96.0f;
 static float g_screenDpiY = 96.0f;
 
-static const int RENDER_SCALE = 2;
+static const int RENDER_SCALE = 1;
 
 static HWND FindGameWindow()
 {
@@ -300,9 +300,9 @@ static void DrawTextQuad(IDirect3DDevice9* device, IDirect3DSurface9* backbuf, i
 static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
 {
     g.SetPageUnit(Gdiplus::UnitPixel);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeHighSpeed);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
     g.SetTextContrast(4);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeNone);
 
     Gdiplus::StringFormat typoFmt(Gdiplus::StringFormat::GenericTypographic());
     typoFmt.SetAlignment(Gdiplus::StringAlignmentNear);
