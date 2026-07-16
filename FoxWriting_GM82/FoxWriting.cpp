@@ -41,6 +41,7 @@ static float g_screenDpiX = 96.0f;
 static float g_screenDpiY = 96.0f;
 
 static const int RENDER_SCALE = 1;
+static const float CHAR_SPACING = 1.0f; // extra pixels between characters
 
 static HWND FindGameWindow()
 {
@@ -301,7 +302,7 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
 {
     g.SetPageUnit(Gdiplus::UnitPixel);
     g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeNone);
     g.SetTextContrast(4);
 
     Gdiplus::StringFormat typoFmt(Gdiplus::StringFormat::GenericTypographic());
@@ -329,10 +330,18 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
         auto lines = SplitLines(item.text);
         if (lines.empty()) continue;
 
-        Gdiplus::RectF bounds;
-        g.MeasureString(lines[0].c_str(), -1, item.font,
-            Gdiplus::PointF(0, 0), &typoFmt, &bounds);
-        float lineH = bounds.Height + scaledSpacing;
+        // measure line height from a single character (or fallback)
+        float lineH = 0;
+        {
+            Gdiplus::RectF cb;
+            if (!lines[0].empty())
+                g.MeasureString(&lines[0][0], 1, item.font,
+                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
+            else if (lines.size() > 1 && !lines[1].empty())
+                g.MeasureString(&lines[1][0], 1, item.font,
+                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
+            lineH = (cb.Height > 0 ? cb.Height : item.font->GetHeight(&g)) + scaledSpacing;
+        }
         float totalH = (float)lines.size() * lineH - scaledSpacing;
 
         float drawY = fy;
@@ -340,34 +349,53 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
         else if (item.valign == 2) drawY = fy - totalH;
 
         for (size_t li = 0; li < lines.size(); li++) {
-            float lineX = fx;
+            const std::wstring& line = lines[li];
             float lineY = drawY + (float)li * lineH;
+            if (item.pixelAlign) lineY = floorf(lineY);
 
-            if (item.halign != 0) {
-                Gdiplus::RectF lb;
-                g.MeasureString(lines[li].c_str(), -1, item.font,
-                    Gdiplus::PointF(0, 0), &typoFmt, &lb);
-                if (item.halign == 1) lineX = fx - lb.Width / 2.0f;
-                else if (item.halign == 2) lineX = fx - lb.Width;
+            // measure full line for alignment
+            float lineW = 0;
+            for (size_t ci = 0; ci < line.length(); ci++) {
+                Gdiplus::RectF cb;
+                g.MeasureString(&line[ci], 1, item.font,
+                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
+                lineW += cb.Width;
+                if (ci + 1 < line.length()) lineW += CHAR_SPACING;
             }
 
-            if (item.pixelAlign) { lineX = floorf(lineX); lineY = floorf(lineY); }
-
-            if (item.doStroke) {
-                Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-                for (int ox = -1; ox <= 1; ox++) {
-                    for (int oy = -1; oy <= 1; oy++) {
-                        if (ox == 0 && oy == 0) continue;
-                        g.DrawString(lines[li].c_str(), -1, item.font,
-                            Gdiplus::PointF(lineX + (float)ox * pageScale, lineY + (float)oy * pageScale),
-                            &typoFmt, &strokeBrush);
-                    }
-                }
-            }
+            float lineX = fx;
+            if (item.halign == 1) lineX = fx - lineW / 2.0f;
+            else if (item.halign == 2) lineX = fx - lineW;
+            if (item.pixelAlign) lineX = floorf(lineX);
 
             Gdiplus::SolidBrush textBrush(textColor);
-            g.DrawString(lines[li].c_str(), -1, item.font,
-                Gdiplus::PointF(lineX, lineY), &typoFmt, &textBrush);
+            Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+
+            for (size_t ci = 0; ci < line.length(); ci++) {
+                Gdiplus::RectF cb;
+                g.MeasureString(&line[ci], 1, item.font,
+                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
+
+                float cx = lineX;
+                float cy = lineY;
+
+                if (item.doStroke) {
+                    for (int ox = -1; ox <= 1; ox++) {
+                        for (int oy = -1; oy <= 1; oy++) {
+                            if (ox == 0 && oy == 0) continue;
+                            g.DrawString(&line[ci], 1, item.font,
+                                Gdiplus::PointF(cx + (float)ox * pageScale, cy + (float)oy * pageScale),
+                                &typoFmt, &strokeBrush);
+                        }
+                    }
+                }
+
+                g.DrawString(&line[ci], 1, item.font,
+                    Gdiplus::PointF(cx, cy), &typoFmt, &textBrush);
+
+                lineX += cb.Width;
+                if (ci + 1 < line.length()) lineX += CHAR_SPACING;
+            }
         }
     }
 }
