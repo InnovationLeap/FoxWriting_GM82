@@ -44,7 +44,7 @@ static int g_viewHeight = 600;
 static float g_screenDpiX = 96.0f;
 static float g_screenDpiY = 96.0f;
 
-static const int RENDER_SCALE = 1;
+static int g_renderScale = 1;
 static const float CHAR_SPACING = 1.0f; // extra pixels between characters
 
 static HWND FindGameWindow()
@@ -460,15 +460,15 @@ static void RenderTextToBackbuffer(IDirect3DDevice9* self)
         int w = (int)desc.Width;
         int h = (int)desc.Height;
 
-        int tw = w * RENDER_SCALE;
-        int th = h * RENDER_SCALE;
+        int tw = w * g_renderScale;
+        int th = h * g_renderScale;
         if (w > 0 && h > 0 && EnsureTextTexture(self, tw, th)) {
             Gdiplus::Bitmap bmp(tw, th, PixelFormat32bppARGB);
-            bmp.SetResolution(g_screenDpiX * RENDER_SCALE, g_screenDpiY * RENDER_SCALE);
+            bmp.SetResolution(g_screenDpiX * g_renderScale, g_screenDpiY * g_renderScale);
             {
                 Gdiplus::Graphics g(&bmp);
                 g.Clear(Gdiplus::Color(0, 0, 0, 0));
-                RenderQueueOnGraphics(g, (float)RENDER_SCALE);
+                RenderQueueOnGraphics(g, (float)g_renderScale);
             }
 
             Gdiplus::BitmapData bd;
@@ -576,6 +576,14 @@ DOUBLE WINAPI FWSetViewSize(DOUBLE w, DOUBLE h)
     g_viewWidth = (int)w;
     g_viewHeight = (int)h;
     DebugLog("FWSetViewSize(%d, %d)", g_viewWidth, g_viewHeight);
+    return TRUE;
+}
+
+DOUBLE WINAPI FWSetRenderScale(DOUBLE scale)
+{
+    g_renderScale = (int)scale;
+    if (g_renderScale < 1) g_renderScale = 1;
+    DebugLog("FWSetRenderScale(%d)", g_renderScale);
     return TRUE;
 }
 
