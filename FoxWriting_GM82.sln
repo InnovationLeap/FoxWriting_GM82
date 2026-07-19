@@ -1,24 +1,25 @@
-
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FoxWriting_GM82", "FoxWriting_GM82\FoxWriting_GM82.vcxproj", "{B3C8A7D1-2E4F-4A9B-8C6D-5F1E3A2B4C0D}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "D3D9Proxy", "D3D9Proxy\D3D9Proxy.vcxproj", "{D3D9PROXY-0000-0000-0000-000000000001}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "D3D9Proxy", "D3D9Proxy\D3D9Proxy.vcxproj", "{9F24AFE7-A7E2-41D6-826A-25FEE37BBFE1}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MsImg32Proxy", "D3D9Proxy\MsImg32Proxy.vcxproj", "{D3D9PROXY-0000-0000-0000-000000000002}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MsImg32Proxy", "D3D9Proxy\MsImg32Proxy.vcxproj", "{D1B0B036-FCAF-4F06-9B96-4B74720396AD}"
 EndProject
 Global
-    GlobalSection(SolutionConfigurationPlatforms) = preSolution
-        Release|Win32 = Release|Win32
-    EndGlobalSection
-    GlobalSection(ProjectConfigurationPlatforms) = postSolution
-        {B3C8A7D1-2E4F-4A9B-8C6D-5F1E3A2B4C0D}.Release|Win32.ActiveCfg = Release|Win32
-        {B3C8A7D1-2E4F-4A9B-8C6D-5F1E3A2B4C0D}.Release|Win32.Build.0 = Release|Win32
-        {D3D9PROXY-0000-0000-0000-000000000001}.Release|Win32.ActiveCfg = Release|Win32
-        {D3D9PROXY-0000-0000-0000-000000000001}.Release|Win32.Build.0 = Release|Win32
-        {D3D9PROXY-0000-0000-0000-000000000002}.Release|Win32.ActiveCfg = Release|Win32
-        {D3D9PROXY-0000-0000-0000-000000000002}.Release|Win32.Build.0 = Release|Win32
-    EndGlobalSection
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B3C8A7D1-2E4F-4A9B-8C6D-5F1E3A2B4C0D}.Release|x86.ActiveCfg = Release|Win32
+		{B3C8A7D1-2E4F-4A9B-8C6D-5F1E3A2B4C0D}.Release|x86.Build.0 = Release|Win32
+		{9F24AFE7-A7E2-41D6-826A-25FEE37BBFE1}.Release|x86.ActiveCfg = Release|Win32
+		{D1B0B036-FCAF-4F06-9B96-4B74720396AD}.Release|x86.ActiveCfg = Release|Win32
+		{D1B0B036-FCAF-4F06-9B96-4B74720396AD}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
 EndGlobal

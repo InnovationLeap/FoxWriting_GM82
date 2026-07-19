@@ -296,6 +296,33 @@ static void DrawTextQuad(IDirect3DDevice9* device, IDirect3DSurface9* backbuf, i
     device->SetRenderState(D3DRS_SCISSORTESTENABLE, sScissor);
 }
 
+// Cache for space character widths keyed by Gdiplus::Font*.
+// GDI+ GenericTypographic() returns ~0 for a single space measured in isolation.
+static std::unordered_map<Gdiplus::Font*, float> g_spaceWidthCache;
+
+// Get or compute the space character width for a font.
+static float GetSpaceWidth(Gdiplus::Graphics& g, Gdiplus::Font* font, Gdiplus::StringFormat* fmt)
+{
+    auto it = g_spaceWidthCache.find(font);
+    if (it != g_spaceWidthCache.end()) return it->second;
+
+    Gdiplus::TextRenderingHint oldHint = g.GetTextRenderingHint();
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+    Gdiplus::RectF bounds1, bounds2;
+    g.MeasureString(L"X X", 3, font, Gdiplus::PointF(0, 0), fmt, &bounds1);
+    g.MeasureString(L"XX", 2, font, Gdiplus::PointF(0, 0), fmt, &bounds2);
+    float sw = bounds1.Width - bounds2.Width;
+
+    // Fallback: if calculation fails, use ~1/4 of the font size (typical for proportional fonts)
+    if (sw <= 0.5f)
+        sw = font->GetSize() * 0.27f;
+
+    g.SetTextRenderingHint(oldHint);
+    g_spaceWidthCache[font] = sw;
+    return sw;
+}
+
 // Draw queued text items onto a Gdiplus::Graphics target (either an HDC or
 // an in-memory Bitmap). Separate function avoids C2712 (__try with C++ dtors).
 static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
@@ -356,10 +383,16 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
             // measure full line for alignment
             float lineW = 0;
             for (size_t ci = 0; ci < line.length(); ci++) {
-                Gdiplus::RectF cb;
-                g.MeasureString(&line[ci], 1, item.font,
-                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
-                lineW += cb.Width;
+                float charW;
+                if (line[ci] == L' ') {
+                    charW = GetSpaceWidth(g, item.font, &typoFmt);
+                } else {
+                    Gdiplus::RectF cb;
+                    g.MeasureString(&line[ci], 1, item.font,
+                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
+                    charW = cb.Width;
+                }
+                lineW += charW;
                 if (ci + 1 < line.length()) lineW += CHAR_SPACING;
             }
 
@@ -372,9 +405,15 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
             Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
 
             for (size_t ci = 0; ci < line.length(); ci++) {
-                Gdiplus::RectF cb;
-                g.MeasureString(&line[ci], 1, item.font,
-                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
+                float charW;
+                if (line[ci] == L' ') {
+                    charW = GetSpaceWidth(g, item.font, &typoFmt);
+                } else {
+                    Gdiplus::RectF cb;
+                    g.MeasureString(&line[ci], 1, item.font,
+                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
+                    charW = cb.Width;
+                }
 
                 float cx = lineX;
                 float cy = lineY;
@@ -393,7 +432,7 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
                 g.DrawString(&line[ci], 1, item.font,
                     Gdiplus::PointF(cx, cy), &typoFmt, &textBrush);
 
-                lineX += cb.Width;
+                lineX += charW;
                 if (ci + 1 < line.length()) lineX += CHAR_SPACING;
             }
         }
@@ -562,6 +601,7 @@ DOUBLE WINAPI FWInit(DOUBLE sprite, DOUBLE argList)
 DOUBLE WINAPI FWReleaseCache()
 {
     g_textQueue.clear();
+    g_spaceWidthCache.clear();
     return TRUE;
 }
 
@@ -582,6 +622,7 @@ DOUBLE WINAPI FWCleanup()
     }
     g_fontMap.clear();
     g_fontCount = 0;
+    g_spaceWidthCache.clear();
     if (g_gdiplusToken) {
         Gdiplus::GdiplusShutdown(g_gdiplusToken);
         g_gdiplusToken = 0;
@@ -635,6 +676,7 @@ DOUBLE WINAPI FWAddFont(LPCSTR name, DOUBLE pt, DOUBLE style)
     fi->yOffset = 0;
     fi->fromFile = false;
     fi->stroke = stroke;
+    fi->spaceWidth = -1.0f;
     int index = g_fontCount++;
     g_fontMap[index] = fi;
     return index;
@@ -698,6 +740,7 @@ DOUBLE WINAPI FWAddFontFromFile(LPCSTR ttf, DOUBLE pt, DOUBLE style)
     fi->yOffset = 0;
     fi->fromFile = true;
     fi->stroke = stroke;
+    fi->spaceWidth = -1.0f;
     int index = g_fontCount++;
     g_fontMap[index] = fi;
     DebugLog("FWAddFontFromFile -> index=%d (font=%p family=%p)", index, font, family);

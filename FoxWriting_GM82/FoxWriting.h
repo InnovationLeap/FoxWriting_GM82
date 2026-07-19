@@ -20,6 +20,7 @@ struct FontInfo {
     float yOffset;
     bool fromFile;
     bool stroke;
+    float spaceWidth; // cached space character width, -1 = not computed
 };
 
 
