@@ -7,8 +7,12 @@
 #include <sstream>
 #include <cstring>
 
+// Debug log control — set to true to re-enable FW_debug.log output.
+static const bool g_debugLogEnabled = false;
+
 static void DebugLog(const char* fmt, ...)
 {
+    if (!g_debugLogEnabled) return;
     char buf[1024];
     va_list args;
     va_start(args, fmt);
