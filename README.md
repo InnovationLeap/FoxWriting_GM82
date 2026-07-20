@@ -1,5 +1,7 @@
 # FoxWriting_GM82
 
+> 语言 / Language: [English](README.en.md)
+
 GameMaker 8.2（社区版）可用的 **FoxWriting 文字渲染插件**（GM8.2 重编译分支）。
 
 原版 FoxWriting 插件在 GM8.1+ 因 GMAPI 变更无法使用，本仓库基于修改版源码重写并编译，保持原有导出函数名与 GML 调用接口不变，
