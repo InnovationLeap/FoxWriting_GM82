@@ -602,13 +602,10 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
                         float dw = (float)cg->bmpW * pageScale;
                         float dh = (float)cg->bmpH * pageScale;
                         if (item.pixelAlign) { dx = floorf(dx); dy = floorf(dy); }
-                        // Align the cached glyph's resolution to the destination
-                        // Graphics DPI so GDI+ applies NO extra dpiScale. Without
-                        // this, DrawImage scales the 96-DPI glyph by destDpi/96,
-                        // which on high-DPI systems (Win11 24H2+, Per-Monitor DPI
-                        // aware) distorted spacing. dw/dh are already in 96-DPI
-                        // reference pixels, matching the rest of the layout math.
-                        cg->bmp->SetResolution(g.GetDpiX(), g.GetDpiY());
+                        // Both D3D and DC paths now render onto a fixed 96-DPI
+                        // bitmap, so the cached glyph (also 96 DPI) and the layout
+                        // math all share one consistent coordinate space. No
+                        // per-destination resolution fiddling is needed.
                         g.DrawImage(cg->bmp, dx, dy, dw, dh);
                     }
                 }
@@ -620,11 +617,36 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
     }
 }
 
-// Thin wrapper for the legacy window-DC fallback (FWPaint).
+// Render the queued text onto the window DC.
+// We render into an intermediate 96-DPI bitmap whose pixel size equals the
+// window client area, then copy it 1:1 to the HDC. This keeps the coordinate
+// system identical to the D3D path and avoids the HDC's own DPI/transform
+// (which varies on high-DPI / Win11 24H2+ systems) from shifting or scaling
+// the text relative to the game image.
 static void RenderQueueOnDC(HDC hdc)
 {
-    Gdiplus::Graphics g(hdc);
-    RenderQueueOnGraphics(g);
+    HWND hwnd = WindowFromDC(hdc);
+    int w = 640, h = 480;
+    if (hwnd) {
+        RECT rc;
+        if (GetClientRect(hwnd, &rc)) {
+            w = rc.right - rc.left;
+            h = rc.bottom - rc.top;
+        }
+    }
+    if (w <= 0) w = 640;
+    if (h <= 0) h = 480;
+
+    Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
+    bmp.SetResolution(96.0f, 96.0f);
+    {
+        Gdiplus::Graphics g(&bmp);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        RenderQueueOnGraphics(g, (float)g_renderScale);
+    }
+
+    Gdiplus::Graphics dest(hdc);
+    dest.DrawImage(&bmp, 0.0f, 0.0f, (Gdiplus::REAL)w, (Gdiplus::REAL)h);
 }
 
 // Separate function to avoid C2712 (__try with C++ dtors in same function).
