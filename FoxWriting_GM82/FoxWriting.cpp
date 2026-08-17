@@ -549,10 +549,6 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
 
         g.SetTextRenderingHint(GetDrawHint(item.font));
 
-        float fx = (item.x + item.xOffset) * pageScale;
-        float fy = (item.y + item.yOffset) * pageScale;
-        if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
-
         float scaledSpacing = item.lineSpacing * pageScale;
 
         auto lines = SplitLines(item.text);
