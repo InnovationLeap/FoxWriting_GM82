@@ -303,6 +303,171 @@ static void DrawTextQuad(IDirect3DDevice9* device, IDirect3DSurface9* backbuf, i
 // Cache for space character widths keyed by Gdiplus::Font*.
 // GDI+ GenericTypographic() returns ~0 for a single space measured in isolation.
 static std::unordered_map<Gdiplus::Font*, float> g_spaceWidthCache;
+// Cache for per-font line height (avoids a per-line MeasureString each frame).
+static std::unordered_map<Gdiplus::Font*, float> g_fontHeightCache;
+
+// ── Per-glyph raster cache ──────────────────────────────────
+// Each unique character (for a given font + stroke flag + fill color) is
+// rasterized by GDI+ exactly ONCE into a transparent Bitmap, then every frame
+// we just blit the cached Bitmap (DrawImage) instead of re-running
+// MeasureString + DrawString per character. This is the same idea as the
+// original FoxWriting's per-character texture cache (mCaches), and removes the
+// dominant per-frame CPU cost that made long CJK text slow.
+struct CachedGlyph {
+    Gdiplus::Bitmap* bmp; // baked glyph (stroke + fill), transparent background
+    float width;          // advance width (logical px), same as MeasureString
+    float drawX;          // glyph top-left X offset relative to pen origin
+    float drawY;          // glyph top-left Y offset relative to pen origin
+    int   bmpW;
+    int   bmpH;
+};
+
+struct GlyphKey {
+    Gdiplus::Font* font;
+    WCHAR          ch;
+    bool           stroke;
+    int            color;
+    bool operator==(const GlyphKey& o) const {
+        return font == o.font && ch == o.ch && stroke == o.stroke && color == o.color;
+    }
+};
+struct GlyphKeyHash {
+    size_t operator()(const GlyphKey& k) const {
+        return ((size_t)(uintptr_t)k.font)
+             ^ ((size_t)k.ch << 1)
+             ^ (k.stroke ? 0x55555555u : 0u)
+             ^ ((size_t)(unsigned)k.color << 3);
+    }
+};
+static std::unordered_map<GlyphKey, CachedGlyph*, GlyphKeyHash> g_glyphCache;
+
+// Scan a transparent Bitmap for its ink bounding box (first/last non-zero alpha
+// row/column). Returns false if the bitmap is fully transparent.
+static bool FindInkBounds(Gdiplus::Bitmap* bmp, int& x0, int& y0, int& x1, int& y1)
+{
+    Gdiplus::BitmapData bd;
+    Gdiplus::Rect r(0, 0, bmp->GetWidth(), bmp->GetHeight());
+    if (bmp->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd) != Gdiplus::Ok)
+        return false;
+    int w = (int)bd.Width, h = (int)bd.Height;
+    BYTE* p = (BYTE*)bd.Scan0;
+    int stride = bd.Stride;
+    x0 = w; y0 = h; x1 = -1; y1 = -1;
+    for (int y = 0; y < h; y++) {
+        BYTE* row = p + (SIZE_T)y * stride;
+        for (int x = 0; x < w; x++) {
+            if (row[(SIZE_T)x * 4 + 3] != 0) { // alpha channel
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+        }
+    }
+    bmp->UnlockBits(&bd);
+    return (x1 >= 0);
+}
+
+// Get (baking on first use) the cached glyph for one character.
+// `color` is the RGB fill (0xRRGGBB); `alpha` (0..1) is folded into the baked
+// pixels so per-item transparency is preserved. Both are part of the cache key.
+static CachedGlyph* GetOrBakeGlyph(Gdiplus::Graphics& g, Gdiplus::Font* font,
+                                   WCHAR ch, bool stroke, int color, float alpha,
+                                   Gdiplus::StringFormat* fmt, float& advWidth)
+{
+    int colorKey = (color & 0x00FFFFFF) | (((int)(alpha * 255.0f) & 0xFF) << 24);
+    GlyphKey key;
+    key.font = font; key.ch = ch; key.stroke = stroke; key.color = colorKey;
+
+    auto it = g_glyphCache.find(key);
+    if (it != g_glyphCache.end()) {
+        advWidth = it->second->width;
+        return it->second;
+    }
+
+    // Measure advance width (identical to the per-frame measure in the old path).
+    Gdiplus::RectF cb;
+    Gdiplus::TextRenderingHint oldHint = g.GetTextRenderingHint();
+    g.SetTextRenderingHint(GetDrawHint(font));
+    g.MeasureString(&ch, 1, font, Gdiplus::PointF(0, 0), fmt, &cb);
+    g.SetTextRenderingHint(oldHint);
+    float adv = cb.Width;
+    if (adv <= 0.0f && ch != L' ') adv = (float)font->GetSize() * 0.5f;
+    advWidth = adv;
+
+    CachedGlyph* cg = new CachedGlyph();
+    cg->width = adv;
+    cg->bmp = NULL;
+    cg->drawX = 0; cg->drawY = 0;
+    cg->bmpW = 0; cg->bmpH = 0;
+
+    if (ch == L' ') {
+        // Space: nothing to draw, only advance.
+        g_glyphCache[key] = cg;
+        return cg;
+    }
+
+    // Bake the glyph into a temporary bitmap at a fixed origin, then crop to ink.
+    const int PAD = 4;
+    int cellW = (int)ceilf(adv) + PAD * 2 + 2;
+    int cellH = (int)ceilf(font->GetHeight(&g)) + PAD * 2 + 2;
+    if (cellW < 1) cellW = 1;
+    if (cellH < 1) cellH = 1;
+
+    Gdiplus::Bitmap tmp(cellW, cellH, PixelFormat32bppARGB);
+    {
+        Gdiplus::Graphics tg(&tmp);
+        tg.SetPageUnit(Gdiplus::UnitPixel);
+        tg.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        tg.SetPixelOffsetMode(Gdiplus::PixelOffsetModeNone);
+        tg.SetTextContrast(4);
+        tg.SetTextRenderingHint(GetDrawHint(font));
+        BYTE a = (BYTE)((colorKey >> 24) & 0xFF);
+        BYTE r = (BYTE)((colorKey >> 16) & 0xFF);
+        BYTE gr = (BYTE)((colorKey >> 8) & 0xFF);
+        BYTE b = (BYTE)(colorKey & 0xFF);
+        Gdiplus::Color fill(a, r, gr, b);
+        Gdiplus::SolidBrush textBrush(fill);
+        Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
+        Gdiplus::PointF origin((Gdiplus::REAL)PAD, (Gdiplus::REAL)PAD);
+        if (stroke) {
+            for (int ox = -1; ox <= 1; ox++) {
+                for (int oy = -1; oy <= 1; oy++) {
+                    if (ox == 0 && oy == 0) continue;
+                    tg.DrawString(&ch, 1, font,
+                        Gdiplus::PointF(origin.X + (Gdiplus::REAL)ox, origin.Y + (Gdiplus::REAL)oy),
+                        fmt, &strokeBrush);
+                }
+            }
+        }
+        tg.DrawString(&ch, 1, font, origin, fmt, &textBrush);
+    }
+
+    int ix0, iy0, ix1, iy1;
+    if (FindInkBounds(&tmp, ix0, iy0, ix1, iy1)) {
+        int cw = ix1 - ix0 + 1;
+        int chh = iy1 - iy0 + 1;
+        Gdiplus::Bitmap* crop = tmp.Clone(ix0, iy0, cw, chh, PixelFormat32bppARGB);
+        cg->bmp = crop;
+        cg->bmpW = cw;
+        cg->bmpH = chh;
+        // Offset of glyph ink top-left relative to the pen origin (0,0).
+        cg->drawX = (float)(ix0 - PAD);
+        cg->drawY = (float)(iy0 - PAD);
+    }
+
+    g_glyphCache[key] = cg;
+    return cg;
+}
+
+static void ClearGlyphCache()
+{
+    for (auto& p : g_glyphCache) {
+        if (p.second->bmp) delete p.second->bmp;
+        delete p.second;
+    }
+    g_glyphCache.clear();
+}
 
 // Get or compute the space character width for a font.
 static float GetSpaceWidth(Gdiplus::Graphics& g, Gdiplus::Font* font, Gdiplus::StringFormat* fmt)
@@ -346,12 +511,6 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
 
         g.SetTextRenderingHint(GetDrawHint(item.font));
 
-        BYTE a = (BYTE)(item.alpha * 255.0f);
-        BYTE r = (item.color >> 16) & 0xFF;
-        BYTE gr = (item.color >> 8) & 0xFF;
-        BYTE b = item.color & 0xFF;
-        Gdiplus::Color textColor(a, r, gr, b);
-
         float fx = (item.x + item.xOffset) * pageScale;
         float fy = (item.y + item.yOffset) * pageScale;
         if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
@@ -361,17 +520,24 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
         auto lines = SplitLines(item.text);
         if (lines.empty()) continue;
 
-        // measure line height from a single character (or fallback)
+        // measure line height (cached per font; only the first visible line's glyph)
         float lineH = 0;
         {
-            Gdiplus::RectF cb;
-            if (!lines[0].empty())
-                g.MeasureString(&lines[0][0], 1, item.font,
-                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
-            else if (lines.size() > 1 && !lines[1].empty())
-                g.MeasureString(&lines[1][0], 1, item.font,
-                    Gdiplus::PointF(0, 0), &typoFmt, &cb);
-            lineH = (cb.Height > 0 ? cb.Height : item.font->GetHeight(&g)) + scaledSpacing;
+            auto fh = g_fontHeightCache.find(item.font);
+            if (fh != g_fontHeightCache.end()) {
+                lineH = fh->second;
+            } else {
+                Gdiplus::RectF cb;
+                if (!lines[0].empty())
+                    g.MeasureString(&lines[0][0], 1, item.font,
+                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
+                else if (lines.size() > 1 && !lines[1].empty())
+                    g.MeasureString(&lines[1][0], 1, item.font,
+                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
+                lineH = (cb.Height > 0 ? cb.Height : item.font->GetHeight(&g));
+                g_fontHeightCache[item.font] = lineH;
+            }
+            lineH += scaledSpacing;
         }
         float totalH = (float)lines.size() * lineH - scaledSpacing;
 
@@ -391,10 +557,9 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
                 if (line[ci] == L' ') {
                     charW = GetSpaceWidth(g, item.font, &typoFmt);
                 } else {
-                    Gdiplus::RectF cb;
-                    g.MeasureString(&line[ci], 1, item.font,
-                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
-                    charW = cb.Width;
+                    // Reuse the glyph cache to get the advance width (no per-frame MeasureString).
+                    GetOrBakeGlyph(g, item.font, line[ci], item.doStroke,
+                                   item.color, item.alpha, &typoFmt, charW);
                 }
                 lineW += charW;
                 if (ci + 1 < line.length()) lineW += CHAR_SPACING;
@@ -405,36 +570,23 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
             else if (item.halign == 2) lineX = fx - lineW;
             if (item.pixelAlign) lineX = floorf(lineX);
 
-            Gdiplus::SolidBrush textBrush(textColor);
-            Gdiplus::SolidBrush strokeBrush(Gdiplus::Color(255, 0, 0, 0));
-
             for (size_t ci = 0; ci < line.length(); ci++) {
                 float charW;
+                CachedGlyph* cg = NULL;
                 if (line[ci] == L' ') {
                     charW = GetSpaceWidth(g, item.font, &typoFmt);
                 } else {
-                    Gdiplus::RectF cb;
-                    g.MeasureString(&line[ci], 1, item.font,
-                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
-                    charW = cb.Width;
-                }
-
-                float cx = lineX;
-                float cy = lineY;
-
-                if (item.doStroke) {
-                    for (int ox = -1; ox <= 1; ox++) {
-                        for (int oy = -1; oy <= 1; oy++) {
-                            if (ox == 0 && oy == 0) continue;
-                            g.DrawString(&line[ci], 1, item.font,
-                                Gdiplus::PointF(cx + (float)ox * pageScale, cy + (float)oy * pageScale),
-                                &typoFmt, &strokeBrush);
-                        }
+                    cg = GetOrBakeGlyph(g, item.font, line[ci], item.doStroke,
+                                       item.color, item.alpha, &typoFmt, charW);
+                    if (cg && cg->bmp) {
+                        float dx = (lineX + cg->drawX) * pageScale;
+                        float dy = (lineY + cg->drawY) * pageScale;
+                        float dw = (float)cg->bmpW * pageScale;
+                        float dh = (float)cg->bmpH * pageScale;
+                        if (item.pixelAlign) { dx = floorf(dx); dy = floorf(dy); }
+                        g.DrawImage(cg->bmp, dx, dy, dw, dh);
                     }
                 }
-
-                g.DrawString(&line[ci], 1, item.font,
-                    Gdiplus::PointF(cx, cy), &typoFmt, &textBrush);
 
                 lineX += charW;
                 if (ci + 1 < line.length()) lineX += CHAR_SPACING;
@@ -614,6 +766,8 @@ DOUBLE WINAPI FWReleaseCache()
 {
     g_textQueue.clear();
     g_spaceWidthCache.clear();
+    g_fontHeightCache.clear();
+    ClearGlyphCache();
     return TRUE;
 }
 
@@ -635,6 +789,8 @@ DOUBLE WINAPI FWCleanup()
     g_fontMap.clear();
     g_fontCount = 0;
     g_spaceWidthCache.clear();
+    g_fontHeightCache.clear();
+    ClearGlyphCache();
     if (g_gdiplusToken) {
         Gdiplus::GdiplusShutdown(g_gdiplusToken);
         g_gdiplusToken = 0;
@@ -771,6 +927,8 @@ DOUBLE WINAPI FWDeleteFont(DOUBLE font)
     delete fi->pfc;
     delete fi;
     g_fontMap.erase(it);
+    // Glyph cache keys reference this font pointer; drop cached entries.
+    ClearGlyphCache();
     return TRUE;
 }
 
