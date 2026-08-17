@@ -415,6 +415,7 @@ static CachedGlyph* GetOrBakeGlyph(Gdiplus::Graphics& g, Gdiplus::Font* font,
     if (cellH < 1) cellH = 1;
 
     Gdiplus::Bitmap tmp(cellW, cellH, PixelFormat32bppARGB);
+    tmp.SetResolution(96.0f, 96.0f); // match destination bitmap & char-advance DPI
     {
         Gdiplus::Graphics tg(&tmp);
         tg.SetPageUnit(Gdiplus::UnitPixel);
@@ -467,6 +468,32 @@ static void ClearGlyphCache()
         delete p.second;
     }
     g_glyphCache.clear();
+    g_fontHeightCache.clear();
+}
+
+// Per-font line height measured on a FIXED 96-DPI Graphics, so it stays
+// consistent with the 96-DPI baked character advances regardless of the
+// destination Graphics DPI (which varies on high-DPI / Win11 24H2+ systems).
+static float GetFontLineHeight(Gdiplus::Font* font)
+{
+    auto it = g_fontHeightCache.find(font);
+    if (it != g_fontHeightCache.end()) return it->second;
+
+    float lineH = (float)font->GetHeight(); // 96-DPI reference by default
+    Gdiplus::Bitmap probe(8, 8, PixelFormat32bppARGB);
+    probe.SetResolution(96.0f, 96.0f);
+    {
+        Gdiplus::Graphics pg(&probe);
+        pg.SetPageUnit(Gdiplus::UnitPixel);
+        Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
+        Gdiplus::RectF cb;
+        if (pg.MeasureString(L"A", 1, font, Gdiplus::PointF(0, 0), &fmt, &cb) == Gdiplus::Ok
+            && cb.Height > 0) {
+            lineH = cb.Height;
+        }
+    }
+    g_fontHeightCache[font] = lineH;
+    return lineH;
 }
 
 // Get or compute the space character width for a font.
@@ -520,25 +547,9 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
         auto lines = SplitLines(item.text);
         if (lines.empty()) continue;
 
-        // measure line height (cached per font; only the first visible line's glyph)
-        float lineH = 0;
-        {
-            auto fh = g_fontHeightCache.find(item.font);
-            if (fh != g_fontHeightCache.end()) {
-                lineH = fh->second;
-            } else {
-                Gdiplus::RectF cb;
-                if (!lines[0].empty())
-                    g.MeasureString(&lines[0][0], 1, item.font,
-                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
-                else if (lines.size() > 1 && !lines[1].empty())
-                    g.MeasureString(&lines[1][0], 1, item.font,
-                        Gdiplus::PointF(0, 0), &typoFmt, &cb);
-                lineH = (cb.Height > 0 ? cb.Height : item.font->GetHeight(&g));
-                g_fontHeightCache[item.font] = lineH;
-            }
-            lineH += scaledSpacing;
-        }
+        // measure line height (cached per font, on a fixed 96-DPI context so it
+        // matches the 96-DPI baked character advances regardless of dest DPI)
+        float lineH = GetFontLineHeight(item.font) + scaledSpacing;
         float totalH = (float)lines.size() * lineH - scaledSpacing;
 
         float drawY = fy;
@@ -584,6 +595,13 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
                         float dw = (float)cg->bmpW * pageScale;
                         float dh = (float)cg->bmpH * pageScale;
                         if (item.pixelAlign) { dx = floorf(dx); dy = floorf(dy); }
+                        // Align the cached glyph's resolution to the destination
+                        // Graphics DPI so GDI+ applies NO extra dpiScale. Without
+                        // this, DrawImage scales the 96-DPI glyph by destDpi/96,
+                        // which on high-DPI systems (Win11 24H2+, Per-Monitor DPI
+                        // aware) distorted spacing. dw/dh are already in 96-DPI
+                        // reference pixels, matching the rest of the layout math.
+                        cg->bmp->SetResolution(g.GetDpiX(), g.GetDpiY());
                         g.DrawImage(cg->bmp, dx, dy, dw, dh);
                     }
                 }
@@ -616,7 +634,14 @@ static void RenderTextToBackbuffer(IDirect3DDevice9* self)
         int th = h * g_renderScale;
         if (w > 0 && h > 0 && EnsureTextTexture(self, tw, th)) {
             Gdiplus::Bitmap bmp(tw, th, PixelFormat32bppARGB);
-            bmp.SetResolution(g_screenDpiX * g_renderScale, g_screenDpiY * g_renderScale);
+            // Render at a fixed 96 DPI so the text bitmap's coordinate space
+            // always matches the 96-DPI baked glyphs (see GetOrBakeGlyph) and the
+            // 96-DPI character advances. Using the real screen DPI here caused a
+            // GDI+ DrawImage dpiScale mismatch on high-DPI systems (Win11 24H2+,
+            // Per-Monitor DPI aware), which inflated inter-character / inter-line
+            // spacing by roughly one glyph. The g_renderScale supersampling is
+            // handled separately via pageScale, so DPI must stay at 96 here.
+            bmp.SetResolution(96.0f, 96.0f);
             {
                 Gdiplus::Graphics g(&bmp);
                 g.Clear(Gdiplus::Color(0, 0, 0, 0));
