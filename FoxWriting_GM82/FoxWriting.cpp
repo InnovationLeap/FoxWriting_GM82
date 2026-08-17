@@ -541,15 +541,22 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
         const TextDrawItem& item = g_textQueue[i];
         if (item.text.empty() || !item.font) continue;
 
-        float fx = (item.x + item.xOffset) * pageScale;
-        float fy = (item.y + item.yOffset) * pageScale;
+        // Layout is performed entirely in UNSCALED 96-DPI logical coordinates.
+        // pageScale (renderScale * coordScale) is applied exactly ONCE, at the
+        // final DrawImage blit below. This guarantees the origin, the advances
+        // (lineX += charW), the per-line width (lineW) and the total block
+        // height (totalH) all live in the same space, so the whole text block
+        // is uniformly scaled at blit time — no origin drift or alignment slip
+        // when pageScale != 1 (2x render or high-DPI displays).
+        float fx = item.x + item.xOffset;
+        float fy = item.y + item.yOffset;
         if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
-        DebugLog("RenderQueueOnGraphics item[%zu]: x=%.1f y=%.1f fx=%.1f fy=%.1f ha=%d va=%d alpha=%.2f textLen=%zu",
-                 i, item.x, item.y, fx, fy, item.halign, item.valign, item.alpha, item.text.length());
+        DebugLog("RenderQueueOnGraphics item[%zu]: x=%.1f y=%.1f fx=%.1f fy=%.1f ha=%d va=%d alpha=%.2f textLen=%zu pageScale=%.3f",
+                 i, item.x, item.y, fx, fy, item.halign, item.valign, item.alpha, item.text.length(), pageScale);
 
         g.SetTextRenderingHint(GetDrawHint(item.font));
 
-        float scaledSpacing = item.lineSpacing * pageScale;
+        float scaledSpacing = item.lineSpacing;
 
         auto lines = SplitLines(item.text);
         if (lines.empty()) continue;
@@ -597,15 +604,16 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
                     cg = GetOrBakeGlyph(g, item.font, line[ci], item.doStroke,
                                        item.color, item.alpha, &typoFmt, charW);
                     if (cg && cg->bmp) {
+                        // The ONE place pageScale is applied: every glyph is
+                        // drawn into the 96-DPI bitmap scaled by pageScale, so
+                        // the cached glyph (baked at 96 DPI, size bmpW/bmpH) and
+                        // the layout advance (charW, in 96-DPI units) stay
+                        // consistent and only the blit magnifies the whole block.
                         float dx = (lineX + cg->drawX) * pageScale;
                         float dy = (lineY + cg->drawY) * pageScale;
                         float dw = (float)cg->bmpW * pageScale;
                         float dh = (float)cg->bmpH * pageScale;
                         if (item.pixelAlign) { dx = floorf(dx); dy = floorf(dy); }
-                        // Both D3D and DC paths now render onto a fixed 96-DPI
-                        // bitmap, so the cached glyph (also 96 DPI) and the layout
-                        // math all share one consistent coordinate space. No
-                        // per-destination resolution fiddling is needed.
                         g.DrawImage(cg->bmp, dx, dy, dw, dh);
                     }
                 }
@@ -652,7 +660,16 @@ static void RenderQueueOnDC(HDC hdc)
     DebugLog("RenderQueueOnDC: hwnd=%p client=%dx%d dpi=%dx%d coordScale=%.3f renderScale=%d queue=%zu",
              hwnd, w, h, dpiX, dpiY, coordScale, g_renderScale, g_textQueue.size());
 
-    Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
+    // Intermediate bitmap is rendered at SUPERSAMPLED physical size
+    // (w * g_renderScale), matching the D3D path, so pageScale = renderScale *
+    // coordScale fits inside it. It is then downscaled onto the actual physical
+    // client rect (w x h) for the final copy.
+    int bw = w * g_renderScale;
+    int bh = h * g_renderScale;
+    if (bw <= 0) bw = w;
+    if (bh <= 0) bh = h;
+
+    Gdiplus::Bitmap bmp(bw, bh, PixelFormat32bppARGB);
     bmp.SetResolution(96.0f, 96.0f);
     {
         Gdiplus::Graphics g(&bmp);
@@ -661,11 +678,13 @@ static void RenderQueueOnDC(HDC hdc)
         RenderQueueOnGraphics(g, (float)g_renderScale * coordScale);
     }
 
-    // Copy 1:1 onto the device. UnitPixel makes the dest rect device pixels, so
-    // no HDC DPI transform is applied (which would otherwise re-scale/shift).
+    // Copy onto the device. UnitPixel makes the dest rect device pixels, so no
+    // HDC DPI transform is applied (which would otherwise re-scale/shift). The
+    // source bitmap is larger (supersampled); we draw it into the real physical
+    // client rect (w x h), so it downscales back to 1:1 physical pixels.
     Gdiplus::Graphics dest(hdc);
     dest.SetPageUnit(Gdiplus::UnitPixel);
-    dest.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+    dest.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
     dest.DrawImage(&bmp, 0.0f, 0.0f, (Gdiplus::REAL)w, (Gdiplus::REAL)h);
 }
 
