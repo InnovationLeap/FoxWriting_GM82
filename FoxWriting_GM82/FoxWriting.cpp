@@ -8,7 +8,7 @@
 #include <cstring>
 
 // Debug log control — set to true to re-enable FW_debug.log output.
-static const bool g_debugLogEnabled = false;
+static const bool g_debugLogEnabled = true;
 
 static void DebugLog(const char* fmt, ...)
 {
@@ -479,25 +479,23 @@ static float GetFontLineHeight(Gdiplus::Font* font)
     auto it = g_fontHeightCache.find(font);
     if (it != g_fontHeightCache.end()) return it->second;
 
-    Gdiplus::Bitmap probe(8, 8, PixelFormat32bppARGB);
+    // Use a reasonable-sized 96-DPI probe so GDI+ has a valid context.
+    Gdiplus::Bitmap probe(64, 64, PixelFormat32bppARGB);
     probe.SetResolution(96.0f, 96.0f);
-    float lineH = 0.0f;
-    {
-        Gdiplus::Graphics pg(&probe);
-        pg.SetPageUnit(Gdiplus::UnitPixel);
+    Gdiplus::Graphics pg(&probe);
+    pg.SetPageUnit(Gdiplus::UnitPixel);
+
+    // Prefer the font's own line height at 96 DPI. This stays consistent with
+    // the character advances (also measured at 96 DPI) regardless of the
+    // destination Graphics DPI.
+    float lineH = (float)font->GetHeight(&pg);
+    if (lineH <= 0.0f) {
         Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
         Gdiplus::RectF cb;
-        if (pg.MeasureString(L"A", 1, font, Gdiplus::PointF(0, 0), &fmt, &cb) == Gdiplus::Ok
+        if (pg.MeasureString(L"\u554a", 1, font, Gdiplus::PointF(0, 0), &fmt, &cb) == Gdiplus::Ok
             && cb.Height > 0) {
             lineH = cb.Height;
         }
-    }
-    // Fallback if MeasureString somehow fails: use the font's height at 96 DPI.
-    if (lineH <= 0.0f) {
-        Gdiplus::Bitmap probe2(8, 8, PixelFormat32bppARGB);
-        probe2.SetResolution(96.0f, 96.0f);
-        Gdiplus::Graphics pg2(&probe2);
-        lineH = (float)font->GetHeight(&pg2);
     }
     g_fontHeightCache[font] = lineH;
     return lineH;
@@ -542,6 +540,12 @@ static void RenderQueueOnGraphics(Gdiplus::Graphics& g, float pageScale = 1.0f)
     for (size_t i = 0; i < g_textQueue.size(); i++) {
         const TextDrawItem& item = g_textQueue[i];
         if (item.text.empty() || !item.font) continue;
+
+        float fx = (item.x + item.xOffset) * pageScale;
+        float fy = (item.y + item.yOffset) * pageScale;
+        if (item.pixelAlign) { fx = floorf(fx); fy = floorf(fy); }
+        DebugLog("RenderQueueOnGraphics item[%zu]: x=%.1f y=%.1f fx=%.1f fy=%.1f ha=%d va=%d alpha=%.2f textLen=%zu",
+                 i, item.x, item.y, fx, fy, item.halign, item.valign, item.alpha, item.text.length());
 
         g.SetTextRenderingHint(GetDrawHint(item.font));
 
@@ -637,15 +641,35 @@ static void RenderQueueOnDC(HDC hdc)
     if (w <= 0) w = 640;
     if (h <= 0) h = 480;
 
+    // The game submits coordinates in its LOGICAL design space (e.g. 640x480).
+    // On high-DPI / Win11 24H2+ the window DC is scaled, so GetClientRect
+    // returns PHYSICAL pixels (design * dpi/96). We must scale the game
+    // coordinates by dpi/96 so text lands at the same relative position as on
+    // a 96-DPI machine. The intermediate bitmap stays at physical size and is
+    // copied 1:1 to the DC (UnitPixel) to avoid a second DPI transform.
+    int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+    int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
+    if (dpiX <= 0) dpiX = 96;
+    if (dpiY <= 0) dpiY = 96;
+    float coordScale = (float)dpiX / 96.0f; // x/y scale are ~equal; use X for both
+
+    DebugLog("RenderQueueOnDC: hwnd=%p client=%dx%d dpi=%dx%d coordScale=%.3f renderScale=%d queue=%zu",
+             hwnd, w, h, dpiX, dpiY, coordScale, g_renderScale, g_textQueue.size());
+
     Gdiplus::Bitmap bmp(w, h, PixelFormat32bppARGB);
     bmp.SetResolution(96.0f, 96.0f);
     {
         Gdiplus::Graphics g(&bmp);
         g.Clear(Gdiplus::Color(0, 0, 0, 0));
-        RenderQueueOnGraphics(g, (float)g_renderScale);
+        // pageScale = renderScale * coordScale: supersampling AND design->physical.
+        RenderQueueOnGraphics(g, (float)g_renderScale * coordScale);
     }
 
+    // Copy 1:1 onto the device. UnitPixel makes the dest rect device pixels, so
+    // no HDC DPI transform is applied (which would otherwise re-scale/shift).
     Gdiplus::Graphics dest(hdc);
+    dest.SetPageUnit(Gdiplus::UnitPixel);
+    dest.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
     dest.DrawImage(&bmp, 0.0f, 0.0f, (Gdiplus::REAL)w, (Gdiplus::REAL)h);
 }
 
@@ -674,7 +698,11 @@ static void RenderTextToBackbuffer(IDirect3DDevice9* self)
             {
                 Gdiplus::Graphics g(&bmp);
                 g.Clear(Gdiplus::Color(0, 0, 0, 0));
-                RenderQueueOnGraphics(g, (float)g_renderScale);
+                // Game coordinates are in logical design space; the backbuffer is
+                // physical pixels. Scale by screenDpi/96 so text lands at the same
+                // relative position on high-DPI displays (no-op at 96 DPI).
+                float coordScale = (g_screenDpiX > 0) ? (g_screenDpiX / 96.0f) : 1.0f;
+                RenderQueueOnGraphics(g, (float)g_renderScale * coordScale);
             }
 
             Gdiplus::BitmapData bd;
