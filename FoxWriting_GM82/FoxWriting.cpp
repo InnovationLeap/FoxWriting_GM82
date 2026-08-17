@@ -479,9 +479,9 @@ static float GetFontLineHeight(Gdiplus::Font* font)
     auto it = g_fontHeightCache.find(font);
     if (it != g_fontHeightCache.end()) return it->second;
 
-    float lineH = (float)font->GetHeight(); // 96-DPI reference by default
     Gdiplus::Bitmap probe(8, 8, PixelFormat32bppARGB);
     probe.SetResolution(96.0f, 96.0f);
+    float lineH = 0.0f;
     {
         Gdiplus::Graphics pg(&probe);
         pg.SetPageUnit(Gdiplus::UnitPixel);
@@ -491,6 +491,13 @@ static float GetFontLineHeight(Gdiplus::Font* font)
             && cb.Height > 0) {
             lineH = cb.Height;
         }
+    }
+    // Fallback if MeasureString somehow fails: use the font's height at 96 DPI.
+    if (lineH <= 0.0f) {
+        Gdiplus::Bitmap probe2(8, 8, PixelFormat32bppARGB);
+        probe2.SetResolution(96.0f, 96.0f);
+        Gdiplus::Graphics pg2(&probe2);
+        lineH = (float)font->GetHeight(&pg2);
     }
     g_fontHeightCache[font] = lineH;
     return lineH;
